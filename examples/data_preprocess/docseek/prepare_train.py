@@ -1,177 +1,194 @@
 """
-Preprocess document understanding datasets to parquet format for DocSeek training.
-Supports: DocVQA, InfoVQA, VISA-Paper, VISA-Wiki
+DocSeek Training Data Preparation Pipeline.
+
+Config-driven, supports iterative expansion.
+Reads config.yaml, loads each data source via processors,
+applies ratio sampling, and outputs train/val parquets.
+
+Usage:
+    python prepare_train.py
+    python prepare_train.py --config custom_config.yaml
+    python prepare_train.py --config config.yaml --override sources.docvqa.enabled=false
 """
 import fire
 import os
 import datasets
+import json
 from pathlib import Path
+from collections import defaultdict
+from typing import Dict, List
 
-SYSTEM_PROMPT = """You are a helpful assistant specialized in document understanding.
+from utils import load_config, save_stats
+from processors import VISAProcessor, DocVQAProcessor, InfoVQAProcessor
 
-# Tools
 
-You may call one or more functions to assist with the user query.
-
-You are provided with function signatures within <tools></tools> XML tags:
-<tools>
-{"type": "function", "function": {"name": "zoom_in", "description": "Zoom into a region of the document image to see finer details like small text, tables, or figures.", "parameters": {"type": "object", "properties": {"bbox_2d": {"type": "array", "description": "Bounding box coordinates [x1, y1, x2, y2] as normalized values between 0 and 1, representing the region to zoom into.", "items": {"type": "number"}}, "target_image": {"type": "number", "description": "The index of the image to zoom into. Index from 1 to the number of images. Choose 1 for the original document image."}}, "required": ["bbox_2d", "target_image"]}}}
-</tools>
-
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
-<tool_call>
-{"name": <function-name>, "arguments": <args-json-object>}
-</tool_call>"""
-
-GUIDELINES = {
-    'vqa': "Guidelines: Examine the document image carefully. If the text or relevant region is too small to read clearly, use the zoom_in tool to get a closer look. Answer the question based on the document content. Reason step by step, and put your final answer within \\boxed{}.",
-    'gnd': "Guidelines: Examine the document image carefully. Locate the described element in the document. If needed, use the zoom_in tool to inspect regions more closely. Provide the bounding box as normalized coordinates [x1, y1, x2, y2] where each value is between 0 and 1. Put your final answer within \\boxed{[x1,y1,x2,y2]}.",
-    'ocr': "Guidelines: Examine the document image carefully. If the text is too small or blurry to read clearly, use the zoom_in tool to get a closer look. Extract and transcribe the requested text exactly as it appears in the document. Put your final answer within \\boxed{}.",
+PROCESSOR_MAP = {
+    "paper_visa": VISAProcessor,
+    "wiki_visa": VISAProcessor,
+    "docvqa": DocVQAProcessor,
+    "infovqa": InfoVQAProcessor,
+    # "mineru_gnd_ocr": MinerUProcessor,  # Phase B
 }
 
 
-def process_docvqa(local_dir: str, split: str = 'train', max_samples: int = None):
-    """Process DocVQA dataset."""
-    ds = datasets.load_dataset('lmms-lab/DocVQA', split='train' if split == 'train' else 'validation')
-    if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
-
-    def process_fn(example, idx):
-        image_path = os.path.join(local_dir, 'images', 'docvqa', f'{split}_{idx}.png')
-        os.makedirs(os.path.dirname(image_path), exist_ok=True)
-        if not os.path.exists(image_path):
-            example['image'].save(image_path)
-        image_abs = os.path.abspath(image_path)
-        question = example['question'] + f"\n\n{GUIDELINES['vqa']}"
-        answers = example.get('answers', [example.get('answer', '')])
-        if isinstance(answers, str):
-            answers = [answers]
-        return {
-            "data_source": "docvqa",
-            "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"<image>\n{question}"}
-            ],
-            "images": [{"image": image_abs}],
-            "ability": "document_understanding",
-            "reward_model": {"style": "rule", "ground_truth": answers},
-            "extra_info": {
-                "split": split,
-                "index": idx,
-                "task_type": "vqa",
-                "dataset": "docvqa",
-                "images": [image_abs],
-            }
-        }
-
-    return ds.map(process_fn, with_indices=True, remove_columns=ds.column_names, num_proc=32)
-
-
-def process_infovqa(local_dir: str, split: str = 'train', max_samples: int = None):
-    """Process InfographicsVQA dataset."""
-    ds = datasets.load_dataset('lmms-lab/InfographicsVQA', split='train' if split == 'train' else 'validation')
-    if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
-
-    def process_fn(example, idx):
-        image_path = os.path.join(local_dir, 'images', 'infovqa', f'{split}_{idx}.png')
-        os.makedirs(os.path.dirname(image_path), exist_ok=True)
-        if not os.path.exists(image_path):
-            example['image'].save(image_path)
-        image_abs = os.path.abspath(image_path)
-        question = example['question'] + f"\n\n{GUIDELINES['vqa']}"
-        answers = example.get('answers', [example.get('answer', '')])
-        if isinstance(answers, str):
-            answers = [answers]
-        return {
-            "data_source": "infovqa",
-            "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"<image>\n{question}"}
-            ],
-            "images": [{"image": image_abs}],
-            "ability": "document_understanding",
-            "reward_model": {"style": "rule", "ground_truth": answers},
-            "extra_info": {
-                "split": split,
-                "index": idx,
-                "task_type": "vqa",
-                "dataset": "infovqa",
-                "images": [image_abs],
-            }
-        }
-
-    return ds.map(process_fn, with_indices=True, remove_columns=ds.column_names, num_proc=32)
-
-
-def process_visa(local_dir: str, variant: str = 'paper', split: str = 'train', max_samples: int = None):
+def sample_by_ratio(task_datasets: Dict[str, List[datasets.Dataset]],
+                    task_ratio: dict,
+                    vqa_source_ratio: dict,
+                    seed: int = 42) -> datasets.Dataset:
     """
-    Process VISA dataset (Paper-VISA or Wiki-VISA).
-    NOTE: Update dataset_path and field names based on actual VISA dataset format.
+    Sample datasets according to task_ratio and vqa_source_ratio.
+    Returns merged dataset.
     """
-    # TODO: Update with actual VISA dataset path and format
-    dataset_path = f'VISA/{variant}'  # placeholder
-    print(f"[WARNING] VISA-{variant} processing is a placeholder. Update dataset_path and field names.")
-    return None
+    all_samples = []
+    stats = {}
 
+    # Determine total dataset size (use all available data, apply ratios as weights)
+    total_available = sum(
+        sum(len(ds) for ds in ds_list)
+        for ds_list in task_datasets.values()
+    )
 
-def main(
-    local_dir: str = 'data/docseek',
-    datasets_to_include: str = 'docvqa,infovqa',  # comma-separated
-    max_samples_per_dataset: int = None,
-    val_size: int = 100,
-    seed: int = 42,
-    version: str = None,
-):
-    """
-    Prepare DocSeek training data.
+    for task_type, ds_list in task_datasets.items():
+        task_weight = task_ratio.get(task_type, 0)
+        if task_weight <= 0 or not ds_list:
+            continue
 
-    Usage:
-        python prepare_train.py --local_dir=data/docseek --datasets_to_include=docvqa,infovqa
-        python prepare_train.py --local_dir=data/docseek --datasets_to_include=docvqa --max_samples_per_dataset=1000 --version=small
-    """
-    local_dir = Path(local_dir)
-    local_dir.mkdir(parents=True, exist_ok=True)
+        task_total = sum(len(ds) for ds in ds_list)
+        target_count = int(total_available * task_weight)
+        # Don't upsample: cap at available
+        target_count = min(target_count, task_total)
 
-    dataset_list = [d.strip() for d in datasets_to_include.split(',')]
-    all_datasets = []
-
-    processors = {
-        'docvqa': lambda: process_docvqa(str(local_dir), 'train', max_samples_per_dataset),
-        'infovqa': lambda: process_infovqa(str(local_dir), 'train', max_samples_per_dataset),
-        'visa_paper': lambda: process_visa(str(local_dir), 'paper', 'train', max_samples_per_dataset),
-        'visa_wiki': lambda: process_visa(str(local_dir), 'wiki', 'train', max_samples_per_dataset),
-    }
-
-    for name in dataset_list:
-        if name in processors:
-            print(f"Processing {name}...")
-            ds = processors[name]()
-            if ds is not None:
-                all_datasets.append(ds)
-                print(f"  {name}: {len(ds)} samples")
+        if task_type == "vqa" and vqa_source_ratio:
+            # Sub-sample VQA by source
+            for ds in ds_list:
+                if len(ds) == 0:
+                    continue
+                source_name = ds[0]["data_source"]
+                source_weight = vqa_source_ratio.get(source_name, 0)
+                if source_weight <= 0:
+                    continue
+                source_target = int(target_count * source_weight)
+                source_target = min(source_target, len(ds))
+                sampled = ds.shuffle(seed=seed).select(range(source_target))
+                all_samples.append(sampled)
+                stats[f"{task_type}/{source_name}"] = source_target
         else:
-            print(f"[WARNING] Unknown dataset: {name}. Available: {list(processors.keys())}")
+            # For GND/OCR: merge all sources, sample proportionally
+            merged_task = datasets.concatenate_datasets(ds_list)
+            target_count = min(target_count, len(merged_task))
+            sampled = merged_task.shuffle(seed=seed).select(range(target_count))
+            all_samples.append(sampled)
+            stats[task_type] = target_count
 
-    if not all_datasets:
-        print("No datasets loaded. Exiting.")
-        return
+    if not all_samples:
+        raise ValueError("No samples after ratio sampling. Check config.")
 
-    merged = datasets.concatenate_datasets(all_datasets)
+    merged = datasets.concatenate_datasets(all_samples)
     merged = merged.shuffle(seed=seed)
 
-    train_dataset, val_dataset = merged.train_test_split(test_size=val_size, seed=seed).values()
+    print(f"\nSampling stats:")
+    for k, v in sorted(stats.items()):
+        print(f"  {k}: {v}")
+    print(f"  TOTAL: {len(merged)}")
 
-    print(f"\nTotal: {len(merged)} samples")
-    print(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
-    print(f"\nSample:\n{train_dataset[0]}")
-
-    output_dir = local_dir / version if version else local_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    train_dataset.to_parquet(str(output_dir / 'train.parquet'))
-    val_dataset.to_parquet(str(output_dir / 'val.parquet'))
-    print(f"\nSaved to {output_dir}/train.parquet and {output_dir}/val.parquet")
+    return merged
 
 
-if __name__ == '__main__':
+def main(config: str = "config.yaml"):
+    """Run the data preparation pipeline."""
+    # Load config
+    config_path = Path(config)
+    if not config_path.exists():
+        config_path = Path(__file__).parent / config
+    cfg = load_config(str(config_path))
+
+    output_dir = cfg["output"]["dir"]
+    val_size = cfg["output"]["val_size"]
+    seed = cfg["output"]["seed"]
+    version = cfg["output"].get("version", None)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Process each enabled source
+    task_datasets: Dict[str, List[datasets.Dataset]] = defaultdict(list)
+    all_stats = {}
+
+    for source_name, source_cfg in cfg["sources"].items():
+        if not source_cfg.get("enabled", False):
+            print(f"[SKIP] {source_name} (disabled)")
+            continue
+
+        processor_cls = PROCESSOR_MAP.get(source_name)
+        if processor_cls is None:
+            print(f"[SKIP] {source_name} (no processor)")
+            continue
+
+        print(f"\n[PROCESSING] {source_name}...")
+        processor = processor_cls(
+            name=source_name,
+            config=source_cfg,
+            output_dir=output_dir,
+        )
+        result = processor.process()
+        all_stats[source_name] = processor.get_stats()
+
+        for task_type, ds in result.items():
+            task_datasets[task_type].append(ds)
+            print(f"  {task_type}: {len(ds)} samples")
+
+    if not any(task_datasets.values()):
+        print("\nNo data produced. Check config sources.")
+        return
+
+    # Sample by ratio
+    print("\n[SAMPLING] Applying task and source ratios...")
+    merged = sample_by_ratio(
+        task_datasets,
+        cfg["task_ratio"],
+        cfg.get("vqa_source_ratio", {}),
+        seed=seed,
+    )
+
+    # Split train/val
+    if val_size > 0 and len(merged) > val_size:
+        splits = merged.train_test_split(test_size=val_size, seed=seed)
+        train_ds = splits["train"]
+        val_ds = splits["test"]
+    else:
+        train_ds = merged
+        val_ds = None
+
+    print(f"\nTrain: {len(train_ds)} samples")
+    if val_ds:
+        print(f"Val: {len(val_ds)} samples")
+
+    # Save
+    out_dir = Path(output_dir) / version if version else Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    train_ds.to_parquet(str(out_dir / "train.parquet"))
+    if val_ds:
+        val_ds.to_parquet(str(out_dir / "val.parquet"))
+
+    print(f"\nSaved to {out_dir}/")
+
+    # Save stats
+    all_stats["final"] = {
+        "train_count": len(train_ds),
+        "val_count": len(val_ds) if val_ds else 0,
+        "task_distribution": dict(train_ds.to_pandas()["extra_info"].apply(lambda x: x["task_type"]).value_counts()),
+        "source_distribution": dict(train_ds.to_pandas()["data_source"].value_counts()),
+    }
+    save_stats(all_stats, str(out_dir / "data_stats.json"))
+
+    # Print sample
+    print(f"\nSample (train[0]):")
+    sample = train_ds[0]
+    print(f"  data_source: {sample['data_source']}")
+    print(f"  task_type: {sample['extra_info']['task_type']}")
+    print(f"  question: {sample['prompt'][1]['content'][:100]}...")
+    print(f"  ground_truth: {sample['reward_model']['ground_truth']}")
+
+
+if __name__ == "__main__":
     fire.Fire(main)

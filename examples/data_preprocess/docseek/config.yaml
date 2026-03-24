@@ -1,0 +1,75 @@
+# DocSeek Data Pipeline Configuration
+
+sources:
+  paper_visa:
+    enabled: true
+    hf_path: "MrLight/paper-visa"
+    split: "train"
+    max_samples: null
+    tasks: ["vqa", "gnd"]
+  wiki_visa:
+    enabled: true
+    hf_path: "MrLight/wiki-visa"
+    split: "train"
+    max_samples: null
+    tasks: ["vqa", "gnd"]
+  docvqa:
+    enabled: true
+    hf_path: "lmms-lab/DocVQA"
+    split: "train"
+    max_samples: null
+    hard_case_only: false  # set true after running hard_case_filter.py
+    hard_case_threshold: 0.8
+    hard_case_scores_file: null  # path to scores jsonl
+  infovqa:
+    enabled: true
+    hf_path: "lmms-lab/InfographicsVQA"
+    split: "train"
+    max_samples: null
+    hard_case_only: false
+    hard_case_threshold: 0.8
+    hard_case_scores_file: null
+  mineru_gnd_ocr:
+    enabled: false
+    mineru_json_dir: "data/mineru_output/"
+    image_dir: "data/document_images/"
+    tasks: ["gnd", "ocr"]
+
+# Task ratio in final dataset
+task_ratio:
+  vqa: 0.6
+  gnd: 0.25
+  ocr: 0.15
+
+# VQA source ratio (within VQA portion)
+vqa_source_ratio:
+  paper_visa: 0.4
+  wiki_visa: 0.3
+  docvqa: 0.15
+  infovqa: 0.15
+
+# Rule-based filters for MinerU data
+filters:
+  min_text_length: 3
+  max_text_length: 200
+  min_bbox_area_ratio: 0.001
+  max_bbox_area_ratio: 0.5
+  element_types:
+    gnd: ["title", "figure", "table", "figure_caption", "table_caption",
+          "footnote", "formula", "page_footnote"]
+    ocr: ["title", "figure_caption", "table_caption", "footnote",
+          "formula", "page_footnote"]
+
+# LLM Judge (optional, Phase C)
+llm_judge:
+  enabled: false
+  model: "gpt-4o-mini"
+  min_quality_score: 3
+  batch_size: 50
+
+# Output settings
+output:
+  dir: "data/docseek"
+  val_size: 100
+  seed: 42
+  version: null
