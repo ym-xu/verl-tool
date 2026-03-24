@@ -44,7 +44,8 @@ def extract_boxed(text: str) -> str:
     return matches[-1].strip() if matches else text.strip()
 
 
-def run_transformers(dataset_name, model_name, batch_size, max_samples, output_dir):
+def run_transformers(dataset_name, model_name, batch_size, max_samples, output_dir,
+                     max_pixels=401408, min_pixels=3136):
     """Run inference using transformers (works on any GPU setup)."""
     import datasets
     from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
@@ -56,7 +57,10 @@ def run_transformers(dataset_name, model_name, batch_size, max_samples, output_d
         ds = ds.select(range(min(max_samples, len(ds))))
 
     print(f"Loading model: {model_name}")
-    processor = AutoProcessor.from_pretrained(model_name)
+    print(f"Image resolution: max_pixels={max_pixels}, min_pixels={min_pixels}")
+    processor = AutoProcessor.from_pretrained(
+        model_name, max_pixels=max_pixels, min_pixels=min_pixels
+    )
     model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
         model_name, torch_dtype=torch.bfloat16, device_map="auto"
     )
@@ -125,7 +129,8 @@ def run_transformers(dataset_name, model_name, batch_size, max_samples, output_d
     print(f"Saved to: {output_file}")
 
 
-def run_vllm(dataset_name, model_name, batch_size, max_samples, output_dir):
+def run_vllm(dataset_name, model_name, batch_size, max_samples, output_dir,
+             max_pixels=401408, min_pixels=3136):
     """Run inference using vLLM for faster batch processing."""
     import datasets
     from vllm import LLM, SamplingParams
@@ -193,13 +198,14 @@ def main(
     output_dir: str = "data/docseek/hard_cases",
     use_vllm: bool = False,
     threshold: float = 0.9,
+    max_pixels: int = 401408,
+    min_pixels: int = 3136,
 ):
     """
     Score DocVQA/InfoVQA samples with base model to identify hard cases.
 
-    Use a model at or above your training base model's capability level.
-    Recommended: Qwen3-VL-8B (same as training base) with threshold 0.9,
-    or Qwen3-VL-72B with threshold 0.95 for stricter filtering.
+    IMPORTANT: max_pixels must match training config (default: 512*28*28=401408).
+    This ensures we identify samples that are hard at the SAME resolution used in training.
 
     Args:
         dataset: "docvqa" or "infovqa"
@@ -209,6 +215,8 @@ def main(
         output_dir: Output directory for scores
         use_vllm: Use vLLM instead of transformers
         threshold: ANLS threshold for hard case (default 0.9)
+        max_pixels: Max image pixels for processor (default: 512*28*28=401408)
+        min_pixels: Min image pixels for processor (default: 4*28*28=3136)
     """
     if dataset not in DATASET_MAP:
         print(f"Unknown dataset: {dataset}. Available: {list(DATASET_MAP.keys())}")
@@ -218,9 +226,9 @@ def main(
     print(f"Samples with ANLS < {threshold} will be considered hard cases")
 
     if use_vllm:
-        run_vllm(dataset, model, batch_size, max_samples, output_dir)
+        run_vllm(dataset, model, batch_size, max_samples, output_dir, max_pixels, min_pixels)
     else:
-        run_transformers(dataset, model, batch_size, max_samples, output_dir)
+        run_transformers(dataset, model, batch_size, max_samples, output_dir, max_pixels, min_pixels)
 
 
 if __name__ == "__main__":

@@ -67,6 +67,16 @@ llm_judge:
   min_quality_score: 3
   batch_size: 50
 
+# Image resolution control
+# max_pixels controls the maximum pixels for model input.
+# Lower = more compression = zoom tool more useful.
+# Must be consistent across: hard_case_filter, training, and evaluation.
+# 512*28*28 = 401408 (~400K pixels): good balance for document understanding.
+# Default Qwen: 1280*28*28 = 1003520 (~1M pixels).
+image:
+  max_pixels: 401408   # 512*28*28
+  min_pixels: 3136     # 4*28*28
+
 # Output settings
 output:
   dir: "data/docseek"

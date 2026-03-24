@@ -8,6 +8,11 @@ train_data=[$(pwd)/data/${dataset_name}/train.parquet]
 val_data=[$(pwd)/data/${dataset_name}/val.parquet]
 model_name=Qwen/Qwen3-VL-4B  # TODO: verify exact HF model path
 
+# Image resolution: must be consistent across hard_case_filter, training, eval
+# 512*28*28 = 401408 pixels. Lower = more compression = zoom more useful.
+max_pixels=401408
+min_pixels=3136
+
 rl_alg=grpo
 n_gpus_per_node=2
 n_nodes=1
@@ -77,6 +82,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     data.max_response_length=$max_response_length \
     data.filter_overlong_prompts=False \
     data.truncation='right' \
+    data.max_pixels=$max_pixels \
+    data.min_pixels=$min_pixels \
     reward_model.reward_manager=$reward_manager \
     reward_model.launch_reward_fn_async=True \
     actor_rollout_ref.model.path=$model_name \

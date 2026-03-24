@@ -64,6 +64,22 @@ VLMs struggle with document images due to: (1) low-quality scans, (2) large imag
 
 Train Qwen3-VL (4B→8B) with a **zoom tool** via GRPO, teaching the model to actively explore document images across all three tasks. Based on pixel_reasoner architecture.
 
+### Image Resolution (Critical)
+
+**`max_pixels = 512*28*28 = 401408` (~400K pixels)** — must be consistent everywhere.
+
+This compresses large documents so small text becomes hard to read → zoom tool becomes useful.
+Pixel_reasoner uses the Qwen default (1280*28*28 ≈ 1M); we intentionally use lower resolution.
+
+| Dataset | Original | After 400K compress | Zoom value |
+|---------|----------|-------------------|------------|
+| InfoVQA | ~1500×2500 (3.75M) | ~490×820 (9x) | Very high |
+| Wiki-VISA | 980×3920 (3.8M) | ~317×1267 (9.5x) | Very high |
+| DocVQA | ~1000×1400 (1.4M) | ~535×750 (3.5x) | Medium |
+| Paper-VISA | ~400×600 (240K) | No compression | Low |
+
+Must match across: `config.yaml`, `train_qwen3vl_4b.sh`, `hard_case_filter.py`, eval scripts.
+
 ### DocSeek Files
 
 ```bash
