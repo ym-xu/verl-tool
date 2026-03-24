@@ -48,3 +48,80 @@ python -m verl_tool.servers.tests.test_python_code_tool python --url=http://loca
 - Action stop tokens passed via temp file, not direct string
 - FSDP2 may cause OOM, fallback to FSDP if needed
 - Copy `.env.example` to `.env` and fill in API keys before running
+
+---
+
+## DocSeek Project
+
+### Motivation
+
+VLMs struggle with document images due to: (1) low-quality scans, (2) large images that must be compressed (InfoVQA, Wiki full-page screenshots). Three document tasks mutually reinforce each other:
+- **VQA** → "why to look" (understanding intent)
+- **GND (Grounding)** → "where to look" (spatial localization)
+- **OCR** → "what to read" (text recognition)
+
+### Approach
+
+Train Qwen3-VL (4B→8B) with a **zoom tool** via GRPO, teaching the model to actively explore document images across all three tasks. Based on pixel_reasoner architecture.
+
+### DocSeek Files
+
+```bash
+# Tool server
+python -m verl_tool.servers.serve --tool_type docseek --port 5500 --workers_per_tool 4
+
+# Test tool
+python -m verl_tool.servers.tests.test_docseek_tool direct
+python -m verl_tool.servers.tests.test_docseek_tool api --url=http://localhost:5500/get_observation
+
+# Data prep
+python examples/data_preprocess/docseek/prepare_train.py --datasets_to_include=docvqa,infovqa
+
+# Train (4B local validation)
+bash examples/train/docseek/train_qwen3vl_4b.sh
+```
+
+| Component | File |
+|-----------|------|
+| Zoom tool | `verl_tool/servers/tools/docseek.py` |
+| Reward manager | `verl_tool/workers/reward_manager/docseek.py` |
+| Training metrics | `verl_tool/workers/reward_manager/reward_score/doc_metrics.py` |
+| Eval: DocVQA/InfoVQA ANLS | `reward_score/eval_benchmarks/docvqa_anls.py` |
+| Eval: TextVQA accuracy | `reward_score/eval_benchmarks/textvqa_accuracy.py` |
+| Eval: OCRBench v1 | `reward_score/eval_benchmarks/ocrbench.py` |
+| Eval: OCRBench v2 | `reward_score/eval_benchmarks/ocrbench_v2.py` |
+| Eval: VISA Paper/Wiki | `reward_score/eval_benchmarks/visa_eval.py` |
+| Eval: WildDoc | `reward_score/eval_benchmarks/wilddoc_eval.py` |
+| Data prep | `examples/data_preprocess/docseek/prepare_train.py` |
+| Training (4B) | `examples/train/docseek/train_qwen3vl_4b.sh` |
+| Tool test | `verl_tool/servers/tests/test_docseek_tool.py` |
+
+### Training Data
+- VQA: DocVQA, InfoVQA, VISA-Paper, VISA-Wiki
+- GND/OCR: Generated from MinerU/PaddleOCR parsing
+
+### Evaluation Benchmarks
+Reward manager routes by `data_source` to official metrics automatically.
+
+| Benchmark | Metric | data_source key |
+|-----------|--------|-----------------|
+| DocVQA | ANLS (τ=0.5) | `docvqa` |
+| InfographicsVQA | ANLS (τ=0.5) | `infovqa` |
+| TextVQA | VQA 10-annotator accuracy | `textvqa` |
+| Paper-VISA | Token subsequence match | `paper_visa` / `visa_paper` |
+| Wiki-VISA | Token subsequence match | `wiki_visa` / `visa_wiki` |
+| OCRBench | Substring containment | `ocrbench` |
+| OCRBench_v2 | Task-specific (30 types) | `ocrbench_v2` |
+| WildDoc-DocVQA | ANLS | `wilddoc_docvqa` |
+| WildDoc-ChartQA | Relaxed accuracy | `wilddoc_chartqa` |
+| WildDoc-TableVQA | Subset-specific | `wilddoc_tablevqa` |
+
+### Development Strategy
+1. Validate pipeline on Qwen3-VL-4B locally
+2. Scale to Qwen3-VL-8B on RunPod
+
+### Reference (pixel_reasoner)
+- Tool: `verl_tool/servers/tools/pixel_reasoner.py`
+- Reward: `verl_tool/workers/reward_manager/pixel_reasoner.py`
+- Data prep: `examples/data_preprocess/pixel_reasoner/prepare_train.py`
+- Training: `examples/train/pixel_reasoner/train_3b.sh`

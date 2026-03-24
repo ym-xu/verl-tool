@@ -1,0 +1,41 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "tool-server-python",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "verl_tool.servers.serve", "--host", "0.0.0.0", "--port", "5500", "--tool_type", "python_code", "--workers_per_tool", "8"],
+      "port": 5500
+    },
+    {
+      "name": "tool-server-browser",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "verl_tool.servers.serve", "--host", "0.0.0.0", "--port", "5501", "--tool_type", "text_browser", "--workers_per_tool", "8"],
+      "port": 5501
+    },
+    {
+      "name": "tool-server-bash",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "verl_tool.servers.serve", "--host", "0.0.0.0", "--port", "5502", "--tool_type", "bash_terminal", "--workers_per_tool", "8"],
+      "port": 5502
+    },
+    {
+      "name": "eval-service",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["eval_service/app.py", "--host", "0.0.0.0", "--port", "8000", "--tool_server_url", "http://localhost:5500/get_observation"],
+      "port": 8000
+    },
+    {
+      "name": "mcp-gateway",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "verl_tool.servers.tools.utils.local_mcp.gateway", "--port", "5600"],
+      "port": 5600
+    },
+    {
+      "name": "retrieval-server",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["-m", "verl_tool.servers.tools.utils.retrieval_server", "--topk", "3"],
+      "port": 8001
+    }
+  ]
+}
