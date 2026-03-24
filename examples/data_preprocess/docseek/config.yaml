@@ -19,7 +19,7 @@ sources:
     split: "train"
     max_samples: null
     hard_case_only: false  # set true after running hard_case_filter.py
-    hard_case_threshold: 0.8
+    hard_case_threshold: 0.9   # use 0.9 with 8B, 0.95 with 72B
     hard_case_scores_file: null  # path to scores jsonl
   infovqa:
     enabled: true
@@ -27,7 +27,7 @@ sources:
     split: "train"
     max_samples: null
     hard_case_only: false
-    hard_case_threshold: 0.8
+    hard_case_threshold: 0.9
     hard_case_scores_file: null
   mineru_gnd_ocr:
     enabled: false
