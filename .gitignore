@@ -319,3 +319,7 @@ verl_step_records/
 /ray-logs
 /models
 /sft_models
+
+# Claude Code local files
+CLAUDE.local.md
+.claude/settings.local.json
