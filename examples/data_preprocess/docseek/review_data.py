@@ -39,8 +39,11 @@ def load_parquet(path: str) -> list[dict]:
         reward = row.get("reward_model", {})
 
         question = ""
-        if isinstance(prompt, list) and len(prompt) > 1:
-            question = prompt[1].get("content", "")
+        try:
+            if len(prompt) > 1:
+                question = prompt[1].get("content", "")
+        except (TypeError, KeyError, IndexError):
+            pass
 
         images = row.get("images", [])
         image_path = ""
