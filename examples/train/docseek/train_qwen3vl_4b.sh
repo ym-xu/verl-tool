@@ -26,10 +26,10 @@ strategy="fsdp2"
 fsdp_size=-1
 ulysses_sequence_parallel_size=1
 
-# Sequence lengths (tuned based on actual usage: prompt max~4200, response max~4100)
-max_prompt_length=6144        # actual max ~4126, leave headroom
-max_response_length=4096      # actual max ~4041
-max_obs_length=4096
+# Sequence lengths
+max_prompt_length=16384       # image tokens can be large (some >8K)
+max_response_length=8192
+max_obs_length=8192
 ppo_max_token_len_per_gpu=$(expr $max_prompt_length + $max_response_length)
 
 # Agent / tool config
