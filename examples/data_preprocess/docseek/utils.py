@@ -87,6 +87,13 @@ def make_sample(
     guideline = GUIDELINES.get(task_type, GUIDELINES['vqa'])
     image_abs = os.path.abspath(image_path)
 
+    # Normalize ground_truth to string for consistent parquet schema.
+    # Lists are JSON-encoded; reward manager handles both formats.
+    if isinstance(ground_truth, list):
+        gt_str = json.dumps(ground_truth, ensure_ascii=False)
+    else:
+        gt_str = str(ground_truth)
+
     sample = {
         "data_source": data_source,
         "prompt": [
@@ -95,7 +102,7 @@ def make_sample(
         ],
         "images": [{"image": image_abs}],
         "ability": "document_understanding",
-        "reward_model": {"style": "rule", "ground_truth": ground_truth},
+        "reward_model": {"style": "rule", "ground_truth": gt_str},
         "extra_info": {
             "split": split,
             "index": index,
