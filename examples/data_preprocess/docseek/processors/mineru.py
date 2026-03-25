@@ -46,6 +46,16 @@ def has_latex_noise(text: str) -> bool:
     return latex_chars / len(text) > 0.3
 
 
+def has_word_merge(text: str, max_word_len: int = 20) -> bool:
+    """Detect MinerU OCR word merging (missing spaces at line breaks).
+    Normal English words rarely exceed 20 chars. Merged words like
+    'includingsmokinghabits' (22 chars) indicate broken OCR.
+    """
+    if not text:
+        return False
+    return any(len(w) > max_word_len for w in text.split())
+
+
 class MinerUProcessor(DatasetProcessor):
     """Process MinerU JSON outputs into GND and OCR training samples.
 
@@ -69,7 +79,8 @@ class MinerUProcessor(DatasetProcessor):
             "dedup_removed": 0,
             "skipped": {"no_image": 0, "garbled": 0, "too_short": 0,
                         "too_long": 0, "discarded_type": 0, "no_bbox": 0,
-                        "latex_noise": 0, "duplicate": 0, "source_rule": 0},
+                        "latex_noise": 0, "word_merge": 0, "duplicate": 0,
+                        "source_rule": 0},
         }
 
     def load(self) -> datasets.Dataset:
@@ -258,14 +269,14 @@ class MinerUProcessor(DatasetProcessor):
         return None
 
     def _check_text_quality(self, text: str) -> bool:
-        """Stricter text quality filters."""
+        """Stricter text quality filters for OCR ground truth."""
         if not text:
             self._stats["skipped"]["too_short"] += 1
             return False
-        if len(text) < 5:  # stricter: was 3, now 5
+        if len(text) < 5:
             self._stats["skipped"]["too_short"] += 1
             return False
-        if len(text) > 150:  # stricter: was 200, now 150
+        if len(text) > 150:
             self._stats["skipped"]["too_long"] += 1
             return False
         if is_garbled(text):
@@ -273,6 +284,10 @@ class MinerUProcessor(DatasetProcessor):
             return False
         if has_latex_noise(text):
             self._stats["skipped"]["latex_noise"] += 1
+            return False
+        # Detect MinerU word merge (OCR: max 20 chars per word)
+        if has_word_merge(text, max_word_len=20):
+            self._stats["skipped"]["word_merge"] += 1
             return False
         # Must have at least 2 real words
         words = [w for w in text.split() if len(w) > 1]
@@ -291,6 +306,10 @@ class MinerUProcessor(DatasetProcessor):
             return "Where is the equation in this document?"
         elif is_title and text:
             short_text = text[:60].strip()
+            # Filter merged title text (GND titles: max 15 chars per word)
+            if has_word_merge(short_text, max_word_len=15):
+                self._stats["skipped"]["word_merge"] += 1
+                return None
             return f'Where is the section titled "{short_text}" in this document?'
         return None
 
