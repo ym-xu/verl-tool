@@ -76,10 +76,10 @@ task_ratio:
 
 # VQA source ratio (within VQA portion)
 vqa_source_ratio:
-  paper_visa: 0.4
+  paper_visa: 0.3
   wiki_visa: 0.3
-  docvqa: 0.15
-  infovqa: 0.15
+  docvqa: 0.2
+  infovqa: 0.2
 
 # Image resolution control
 # 512*28*28 = 401408 (~400K pixels): good balance for document understanding.
@@ -93,4 +93,4 @@ output:
   dir: "data/docseek"
   val_size: 100
   seed: 42
-  version: "v2"
+  version: "v2_vqa_only"

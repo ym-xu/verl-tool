@@ -1,75 +1,93 @@
 set -x
-# ========== DocSeek: Document Understanding with Zoom Tool (Qwen3-VL-4B) ==========
-# This is the validation script for local GPU testing.
-# Use train_qwen3vl_8b.sh for full-scale training on RunPod.
+# ========== DocSeek VQA-only: Qwen3-VL-4B on 4×L40S ==========
 
-dataset_name=docseek
+dataset_name=docseek/v2_vqa_only
 train_data=[$(pwd)/data/${dataset_name}/train.parquet]
 val_data=[$(pwd)/data/${dataset_name}/val.parquet]
-model_name=Qwen/Qwen3-VL-4B  # TODO: verify exact HF model path
+model_name=Qwen/Qwen3-VL-4B-Instruct
 
-# Image resolution: must be consistent across hard_case_filter, training, eval
-# 512*28*28 = 401408 pixels. Lower = more compression = zoom more useful.
+# Image resolution: 512*28*28 = 401408 (~400K pixels)
 max_pixels=401408
 min_pixels=3136
 
+# RL algorithm
 rl_alg=grpo
-n_gpus_per_node=2
+n=8                    # GRPO group size
+batch_size=64          # total batch size across all GPUs
+ppo_mini_batch_size=32
+
+# GPU config (4×L40S 48GB)
+n_gpus_per_node=4
 n_nodes=1
-n=4
-batch_size=32
-ppo_mini_batch_size=16
-max_prompt_length=16384
-max_response_length=16384
+tensor_model_parallel_size=1  # 4B fits on single L40S
+gpu_memory_utilization=0.7    # conservative for L40S
+do_offload=True               # FSDP param + optimizer offload
+strategy="fsdp2"
+fsdp_size=-1
+ulysses_sequence_parallel_size=1
+
+# Sequence lengths
+max_prompt_length=16384       # image tokens can be large
+max_response_length=8192      # VQA answers are short
 max_obs_length=8192
 ppo_max_token_len_per_gpu=$(expr $max_prompt_length + $max_response_length)
+
+# Agent / tool config
+enable_agent=True
+action_stop_tokens='</tool_call>'
+max_turns=2                   # at most 1 zoom
+mask_observations=True
+enable_mtrl=True
+max_action_length=2048
+
+# Training
+lr=1e-6
 temperature=1.0
 top_p=1.0
-enable_agent=True
-strategy="fsdp2"
-action_stop_tokens='</tool_call>'
-max_turns=2
 kl_loss_coef=0.0
 kl_coef=0
 entropy_coeff=0
 kl_loss_type=low_var_kl
-lr=1e-6
-reward_manager=docseek
+
+# Micro batch (per GPU)
 ppo_micro_batch_size_per_gpu=1
 log_prob_micro_batch_size_per_gpu=4
-tensor_model_parallel_size=1
-gpu_memory_utilization=0.8
-do_offload=True
-use_dynamic_bsz=False
-ulysses_sequence_parallel_size=1
-fsdp_size=-1
-additional_eos_token_ids=[151645]  # TODO: verify Qwen3-VL <|im_end|> token id
-mask_observations=True
-enable_mtrl=True
-max_action_length=2048
-model_pretty_name=$(echo $model_name | tr '/' '_' | tr '[:upper:]' '[:lower:]')
-max_num_batched_tokens=5000
-run_name_postfix=""
-run_name="${reward_manager}-${strategy}-agent-${model_pretty_name}-${rl_alg}-n${n}-b${batch_size}-t${temperature}-lr${lr}${run_name_postfix}"
 
-export VERL_RUN_ID=$run_name
-export NCCL_DEBUG=INFO
-export VLLM_USE_V1=1
+# Reward
+reward_manager=docseek
+
+# Qwen3-VL special tokens
+additional_eos_token_ids=[151645]  # <|im_end|>
+
+# vLLM
+use_dynamic_bsz=False
+max_num_batched_tokens=5000
 rollout_mode='async'
 
-# temp file for action tokens
+# Run name
+model_pretty_name=$(echo $model_name | tr '/' '_' | tr '[:upper:]' '[:lower:]')
+run_name_postfix="-vqa-only"
+run_name="${reward_manager}-${strategy}-agent-${model_pretty_name}-${rl_alg}-n${n}-b${batch_size}-lr${lr}${run_name_postfix}"
+
+export VERL_RUN_ID=$run_name
+export NCCL_DEBUG=WARN
+export VLLM_USE_V1=1
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+
+# Action stop tokens temp file
 action_stop_tokens_file="$(pwd)$(mktemp)"
 mkdir -p $(dirname $action_stop_tokens_file)
 echo -e -n "$action_stop_tokens" | tee $action_stop_tokens_file
 echo "action_stop_tokens_file=$action_stop_tokens_file"
 
-# Start docseek tool server
+# Start DocSeek tool server
 host=$(hostname -i | awk '{print $1}')
 port=$(shuf -i 30000-31000 -n 1)
 tool_server_url=http://$host:$port/get_observation
-python -m verl_tool.servers.serve --host $host --port $port --tool_type "docseek" --workers_per_tool 4 &
+python -m verl_tool.servers.serve --host $host --port $port --tool_type "docseek" --workers_per_tool 8 &
 server_pid=$!
 echo "DocSeek tool server (pid=$server_pid) started at $tool_server_url"
+sleep 10  # wait for server to start
 
 PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     algorithm.adv_estimator=$rl_alg \
@@ -152,10 +170,10 @@ PYTHONUNBUFFERED=1 python3 -m verl_tool.trainer.main_ppo \
     trainer.n_gpus_per_node=$n_gpus_per_node \
     trainer.nnodes=$n_nodes \
     +trainer.remove_previous_ckpt_in_save=True \
-    trainer.save_freq=10 \
-    trainer.test_freq=10 \
+    trainer.save_freq=20 \
+    trainer.test_freq=20 \
     trainer.total_epochs=10 \
-    trainer.total_training_steps=100 \
+    trainer.total_training_steps=200
 
 pkill -P -9 $server_pid
 kill -9 $server_pid
