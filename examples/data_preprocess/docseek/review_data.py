@@ -174,10 +174,16 @@ body { font-family: -apple-system, 'Segoe UI', sans-serif; background: var(--bg)
     border: none !important; font-weight: 600; padding: 6px 18px !important;
 }
 .btn-bad:hover { opacity: 0.85; }
+.btn-good {
+    background: var(--green) !important; color: #fff !important;
+    border: none !important; font-weight: 600; padding: 6px 18px !important;
+}
+.btn-good:hover { opacity: 0.85; }
 .btn-undo {
     background: var(--bg3) !important; color: var(--green) !important;
     border: 1px solid var(--green) !important;
 }
+.badge-good { background: rgba(63,185,80,0.25); color: var(--green); }
 .main { display: flex; height: calc(100vh - 140px); }
 .left-panel { flex: 0 0 55%; max-width: 55%; overflow: auto; padding: 16px; }
 .right-panel { flex: 1; overflow: auto; padding: 16px; border-left: 1px solid var(--border); }
@@ -251,6 +257,7 @@ body { font-family: -apple-system, 'Segoe UI', sans-serif; background: var(--bg)
     <select id="f-label">
         <option value="">All</option>
         <option value="unlabeled">Unlabeled</option>
+        <option value="good">Good</option>
         <option value="bad">Bad</option>
     </select>
     <label>Search:</label>
@@ -264,7 +271,8 @@ body { font-family: -apple-system, 'Segoe UI', sans-serif; background: var(--bg)
     <button onclick="go(1)">Next ▶</button>
     <button onclick="go(10)">+10 ⏩</button>
     <button onclick="goRandom()" style="margin-left:12px">🎲 Random</button>
-    <button id="btn-bad" class="btn-bad" onclick="markBad()" style="margin-left:auto">❌ BAD</button>
+    <button id="btn-good" class="btn-good" onclick="markGood()" style="margin-left:auto">✅ OK (Space)</button>
+    <button id="btn-bad" class="btn-bad" onclick="markBad()">❌ BAD (B)</button>
 </div>
 <div class="main">
     <div class="left-panel">
@@ -364,7 +372,8 @@ function render() {
 
     // Meta
     const tb = `<span class="badge badge-${s.task_type}">${s.task_type}</span>`;
-    const lb = s.label === 'bad' ? ' <span class="badge badge-bad">BAD</span>' : '';
+    const lb = s.label === 'bad' ? ' <span class="badge badge-bad">BAD</span>' :
+               s.label === 'good' ? ' <span class="badge badge-good">OK</span>' : '';
     const bb = s.bbox ? `[${s.bbox.join(', ')}]` : '—';
     document.getElementById('meta').innerHTML = `
         <span class="key">Index</span><span class="val">#${s.index}</span>
@@ -387,16 +396,22 @@ function render() {
         document.getElementById('guidelines-section').style.display = 'none';
     }
 
-    // Bad button state
-    const btn = document.getElementById('btn-bad');
-    if (s.label === 'bad') {
-        btn.textContent = '↩️ Undo BAD';
-        btn.className = 'btn-undo';
-        btn.onclick = undoBad;
+    // Button states
+    const btnGood = document.getElementById('btn-good');
+    const btnBad = document.getElementById('btn-bad');
+    if (s.label === 'bad' || s.label === 'good') {
+        btnGood.textContent = '↩️ Undo';
+        btnGood.className = 'btn-undo';
+        btnGood.onclick = undoLabel;
+        btnBad.style.display = 'none';
     } else {
-        btn.textContent = '❌ BAD';
-        btn.className = 'btn-bad';
-        btn.onclick = markBad;
+        btnGood.textContent = '✅ OK (Space)';
+        btnGood.className = 'btn-good';
+        btnGood.onclick = markGood;
+        btnBad.textContent = '❌ BAD (B)';
+        btnBad.className = 'btn-bad';
+        btnBad.onclick = markBad;
+        btnBad.style.display = '';
     }
 
     document.getElementById('bad-count').textContent = `Bad: ${badCount}`;
@@ -434,6 +449,19 @@ function drawBbox(s) {
     ctx.fillText(label, x1+6, y1-10);
 }
 
+async function markGood() {
+    if (!currentSample) return;
+    const r = await fetch('/api/label', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: currentSample.index, label: 'good'})
+    });
+    if ((await r.json()).ok) {
+        currentSample.label = 'good';
+        go(1);
+    }
+}
+
 async function markBad() {
     if (!currentSample) return;
     const r = await fetch('/api/label', {
@@ -448,7 +476,7 @@ async function markBad() {
     }
 }
 
-async function undoBad() {
+async function undoLabel() {
     if (!currentSample) return;
     const r = await fetch('/api/label', {
         method: 'POST',
@@ -456,8 +484,8 @@ async function undoBad() {
         body: JSON.stringify({index: currentSample.index, label: ''})
     });
     if ((await r.json()).ok) {
+        if (currentSample.label === 'bad') badCount = Math.max(0, badCount - 1);
         currentSample.label = '';
-        badCount = Math.max(0, badCount - 1);
         render();
     }
 }
@@ -546,7 +574,7 @@ document.addEventListener('keydown', e => {
     else if (e.key==='r'||e.key==='R') goRandom();
     else if (e.key==='b'||e.key==='B') markBad();
     else if (e.key==='s'||e.key==='S') saveBbox();
-    else if (e.key===' ') { e.preventDefault(); go(1); }
+    else if (e.key===' ') { e.preventDefault(); markGood(); }
 });
 
 init();
@@ -600,7 +628,9 @@ class Handler(SimpleHTTPRequestHandler):
                     continue
                 if label == "bad" and s["label"] != "bad":
                     continue
-                if label == "unlabeled" and s["label"] == "bad":
+                if label == "good" and s["label"] != "good":
+                    continue
+                if label == "unlabeled" and s["label"] in ("bad", "good"):
                     continue
                 if kw and kw not in s["question"].lower() and kw not in s["ground_truth"].lower():
                     continue
