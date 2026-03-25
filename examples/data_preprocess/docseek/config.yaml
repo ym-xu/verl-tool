@@ -6,23 +6,19 @@ data_root: "/data/151-1/users/yiming/dococr_data"
 sources:
   paper_visa:
     enabled: true
-    image_dir: "${data_root}/train_source/VISA/paper_visa_image"
-    # QA loaded from HuggingFace (MrLight/paper-visa) — images matched by filename
-    hf_path: "MrLight/paper-visa"
-    split: "train"
+    qa_file: "${data_root}/pipeline/formatted/visa_paper_train.jsonl"
+    data_root: "${data_root}"
     max_samples: null
-    tasks: ["vqa"]
-    # Hard case filter (pass@8)
+    tasks: ["vqa", "gnd"]
     scores_file: "${data_root}/pipeline/scores/Qwen3-VL-8B-Instruct/paper_visa_scores_v2.jsonl"
     filter_pass_rate: true   # only keep pass_rate < 1.0
 
   wiki_visa:
     enabled: true
-    image_dir: "${data_root}/train_source/VISA/wiki_visa_image"
-    hf_path: "MrLight/wiki-visa"
-    split: "train"
+    qa_file: "${data_root}/pipeline/formatted/visa_wiki_train.jsonl"
+    data_root: "${data_root}"
     max_samples: null
-    tasks: ["vqa"]
+    tasks: ["vqa", "gnd"]
     scores_file: "${data_root}/pipeline/scores/Qwen3-VL-8B-Instruct/wiki_visa_scores_v2.jsonl"
     filter_pass_rate: true
 
