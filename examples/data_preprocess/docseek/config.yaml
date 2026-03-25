@@ -51,6 +51,10 @@ sources:
       docvqa: "${data_root}/train_source/DocVQA/docvqa_image"
       infovqa: "${data_root}/train_source/InfographicsVQA/images"
     tasks: ["gnd", "ocr"]
+    # Pass rate filtering (set true after running test_mineru_passrate.py)
+    filter_pass_rate: false
+    gnd_scores_file: null  # "data/docseek/mineru_scores/gnd_scores.jsonl"
+    ocr_scores_file: null  # "data/docseek/mineru_scores/ocr_scores.jsonl"
 
 # Task ratio in final dataset
 task_ratio:

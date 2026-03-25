@@ -55,6 +55,9 @@ class MinerUProcessor(DatasetProcessor):
         self.mineru_dirs = config["mineru_dirs"]  # {"docvqa": path, "infovqa": path}
         self.image_dirs = config["image_dirs"]    # {"docvqa": path, "infovqa": path}
         self.tasks = config.get("tasks", ["gnd", "ocr"])
+        self.filter_pass_rate = config.get("filter_pass_rate", False)
+        self.gnd_scores_file = config.get("gnd_scores_file", None)
+        self.ocr_scores_file = config.get("ocr_scores_file", None)
         self._stats = {
             "name": name, "total_files": 0, "total_elements": 0,
             "after_filter": 0, "gnd_count": 0, "ocr_count": 0,
@@ -65,9 +68,25 @@ class MinerUProcessor(DatasetProcessor):
     def load(self) -> datasets.Dataset:
         return None  # not used
 
+    def _load_scores(self, scores_file: Optional[str]) -> Dict[int, float]:
+        """Load pass_rate scores keyed by index."""
+        scores = {}
+        if not scores_file or not os.path.exists(scores_file):
+            return scores
+        with open(scores_file, 'r') as f:
+            for line in f:
+                item = json.loads(line)
+                scores[item["index"]] = item["pass_rate"]
+        print(f"  Loaded {len(scores)} scores from {os.path.basename(scores_file)}")
+        return scores
+
     def process(self) -> Dict[str, datasets.Dataset]:
         gnd_samples = []
         ocr_samples = []
+
+        # Load pass rate scores if available
+        gnd_scores = self._load_scores(self.gnd_scores_file) if self.filter_pass_rate else {}
+        ocr_scores = self._load_scores(self.ocr_scores_file) if self.filter_pass_rate else {}
 
         for source_name, mineru_dir in self.mineru_dirs.items():
             image_dir = self.image_dirs.get(source_name)
@@ -125,11 +144,24 @@ class MinerUProcessor(DatasetProcessor):
                         elif task_type == "ocr" and "ocr" in self.tasks:
                             ocr_samples.append(sample)
 
+        # Apply pass rate filter if scores are available
+        if self.filter_pass_rate and gnd_scores:
+            before = len(gnd_samples)
+            gnd_samples = [s for i, s in enumerate(gnd_samples)
+                           if gnd_scores.get(i, 0.0) < 1.0]
+            print(f"  GND pass_rate filter: {before} → {len(gnd_samples)}")
+
+        if self.filter_pass_rate and ocr_scores:
+            before = len(ocr_samples)
+            ocr_samples = [s for i, s in enumerate(ocr_samples)
+                           if ocr_scores.get(i, 0.0) < 1.0]
+            print(f"  OCR pass_rate filter: {before} → {len(ocr_samples)}")
+
         results = {}
         self._stats["gnd_count"] = len(gnd_samples)
         self._stats["ocr_count"] = len(ocr_samples)
         self._stats["after_filter"] = len(gnd_samples) + len(ocr_samples)
-        print(f"  MinerU total: GND={len(gnd_samples)}, OCR={len(ocr_samples)}")
+        print(f"  MinerU final: GND={len(gnd_samples)}, OCR={len(ocr_samples)}")
 
         if gnd_samples:
             results["gnd"] = datasets.Dataset.from_list(gnd_samples)
