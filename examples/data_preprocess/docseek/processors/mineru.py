@@ -3,30 +3,31 @@ MinerU GND/OCR processor.
 Reads MinerU JSON output, applies rule-based filtering,
 generates GND and OCR training samples.
 
+Key fixes:
+- bbox already in 0-1000 (converted by previous project), no double conversion
+- Deduplication within same document
+- No caption/footnote GND/OCR (parent bbox doesn't match caption location)
+- InfoVQA: only text OCR (infographics have irregular table/image elements)
+- Stricter text quality filters
+
 MinerU element format:
 {
     "type": "text" | "table" | "image" | "equation" | "discarded",
     "text": "...",
-    "bbox": [x1, y1, x2, y2],  # pixel coordinates
-    "page_idx": 0,
-    "text_level": 1,  # optional, 1 = title/heading
-    "table_caption": ["..."],   # optional
-    "image_caption": ["..."],   # optional
-    "table_footnote": ["..."],  # optional
-    "image_footnote": ["..."],  # optional
-    "table_body": "...",        # optional
+    "bbox": [x1, y1, x2, y2],  # already in 0-1000 coordinates
+    "text_level": 1,            # optional, 1 = title/heading
+    ...
 }
 """
 import os
 import json
-import re
 import datasets
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 from .base import DatasetProcessor
 try:
-    from ..utils import make_sample, normalize_bbox_pixel_to_01, format_bbox_str
+    from ..utils import make_sample, format_bbox_str
 except ImportError:
-    from utils import make_sample, normalize_bbox_pixel_to_01, format_bbox_str
+    from utils import make_sample, format_bbox_str
 
 
 def is_garbled(text: str, threshold: float = 0.3) -> bool:
@@ -37,36 +38,42 @@ def is_garbled(text: str, threshold: float = 0.3) -> bool:
     return alnum / len(text) < threshold
 
 
-def get_image_size(image_path: str) -> Optional[Tuple[int, int]]:
-    """Get image width, height without loading full image."""
-    try:
-        from PIL import Image
-        with Image.open(image_path) as img:
-            return img.size  # (width, height)
-    except Exception:
-        return None
+def has_latex_noise(text: str) -> bool:
+    """Check if text has excessive LaTeX artifacts."""
+    if not text:
+        return True
+    latex_chars = sum(1 for c in text if c in '\\{}$^_')
+    return latex_chars / len(text) > 0.3
 
 
 class MinerUProcessor(DatasetProcessor):
-    """Process MinerU JSON outputs into GND and OCR training samples."""
+    """Process MinerU JSON outputs into GND and OCR training samples.
+
+    Important: MinerU bbox is already in 0-1000 coordinates (converted upstream).
+    We do NOT re-normalize — just use bbox directly.
+    """
 
     def __init__(self, name: str, config: dict, output_dir: str):
         super().__init__(name, config, output_dir)
-        self.mineru_dirs = config["mineru_dirs"]  # {"docvqa": path, "infovqa": path}
-        self.image_dirs = config["image_dirs"]    # {"docvqa": path, "infovqa": path}
+        self.mineru_dirs = config["mineru_dirs"]
+        self.image_dirs = config["image_dirs"]
         self.tasks = config.get("tasks", ["gnd", "ocr"])
         self.filter_pass_rate = config.get("filter_pass_rate", False)
         self.gnd_scores_file = config.get("gnd_scores_file", None)
         self.ocr_scores_file = config.get("ocr_scores_file", None)
+        # Per-source rules
+        self.source_rules = config.get("source_rules", {})
         self._stats = {
             "name": name, "total_files": 0, "total_elements": 0,
             "after_filter": 0, "gnd_count": 0, "ocr_count": 0,
+            "dedup_removed": 0,
             "skipped": {"no_image": 0, "garbled": 0, "too_short": 0,
-                        "too_long": 0, "discarded_type": 0, "no_bbox": 0},
+                        "too_long": 0, "discarded_type": 0, "no_bbox": 0,
+                        "latex_noise": 0, "duplicate": 0, "source_rule": 0},
         }
 
     def load(self) -> datasets.Dataset:
-        return None  # not used
+        return None
 
     def _load_scores(self, scores_file: Optional[str]) -> Dict[int, float]:
         """Load pass_rate scores keyed by index."""
@@ -84,7 +91,6 @@ class MinerUProcessor(DatasetProcessor):
         gnd_samples = []
         ocr_samples = []
 
-        # Load pass rate scores if available
         gnd_scores = self._load_scores(self.gnd_scores_file) if self.filter_pass_rate else {}
         ocr_scores = self._load_scores(self.ocr_scores_file) if self.filter_pass_rate else {}
 
@@ -98,31 +104,35 @@ class MinerUProcessor(DatasetProcessor):
             self._stats["total_files"] += len(files)
             print(f"  Processing {source_name}: {len(files)} MinerU files")
 
+            # Get source-specific rules
+            rules = self.source_rules.get(source_name, {})
+            # InfoVQA: only text OCR, no table/image GND (infographics are irregular)
+            gnd_types = rules.get("gnd_types", ["table", "image", "equation"])
+            ocr_types = rules.get("ocr_types", ["text", "equation"])
+
             for fname in files:
                 doc_id = fname.replace(".json", "")
-                json_path = os.path.join(mineru_dir, fname)
 
-                # Find corresponding image
                 image_path = self._find_image(doc_id, image_dir)
                 if image_path is None:
                     self._stats["skipped"]["no_image"] += 1
                     continue
 
-                img_size = get_image_size(image_path)
-                if img_size is None:
-                    continue
-                img_w, img_h = img_size
-
-                # Load and process elements
                 try:
-                    elements = json.load(open(json_path))
+                    elements = json.load(open(os.path.join(mineru_dir, fname)))
                 except Exception:
                     continue
 
+                # Dedup within document: track seen texts and bboxes
+                seen_texts: Set[str] = set()
+                seen_bboxes: Set[str] = set()
+
                 for elem in elements:
                     self._stats["total_elements"] += 1
+
                     result = self._process_element(
-                        elem, doc_id, source_name, image_path, img_w, img_h
+                        elem, doc_id, source_name, image_path,
+                        gnd_types, ocr_types, seen_texts, seen_bboxes
                     )
                     if result is None:
                         continue
@@ -132,17 +142,6 @@ class MinerUProcessor(DatasetProcessor):
                         gnd_samples.append(sample)
                     elif task_type == "ocr" and "ocr" in self.tasks:
                         ocr_samples.append(sample)
-
-                # Also extract from captions and footnotes
-                for elem in elements:
-                    extras = self._extract_caption_footnote_samples(
-                        elem, doc_id, source_name, image_path, img_w, img_h
-                    )
-                    for task_type, sample in extras:
-                        if task_type == "gnd" and "gnd" in self.tasks:
-                            gnd_samples.append(sample)
-                        elif task_type == "ocr" and "ocr" in self.tasks:
-                            ocr_samples.append(sample)
 
         # Apply pass rate filter if scores are available
         if self.filter_pass_rate and gnd_scores:
@@ -162,6 +161,7 @@ class MinerUProcessor(DatasetProcessor):
         self._stats["ocr_count"] = len(ocr_samples)
         self._stats["after_filter"] = len(gnd_samples) + len(ocr_samples)
         print(f"  MinerU final: GND={len(gnd_samples)}, OCR={len(ocr_samples)}")
+        print(f"  Skipped: {self._stats['skipped']}")
 
         if gnd_samples:
             results["gnd"] = datasets.Dataset.from_list(gnd_samples)
@@ -180,13 +180,14 @@ class MinerUProcessor(DatasetProcessor):
                 return path
         return None
 
-    def _process_element(self, elem, doc_id, source, image_path, img_w, img_h):
-        """Process a single MinerU element into a training sample."""
+    def _process_element(self, elem, doc_id, source, image_path,
+                         gnd_types, ocr_types, seen_texts, seen_bboxes):
+        """Process a single MinerU element. No bbox re-normalization needed."""
         etype = elem.get("type", "")
         text = elem.get("text", "").strip()
         bbox = elem.get("bbox")
 
-        # Skip discarded elements
+        # Skip discarded / empty type
         if etype in ("discarded", ""):
             self._stats["skipped"]["discarded_type"] += 1
             return None
@@ -195,22 +196,25 @@ class MinerUProcessor(DatasetProcessor):
             self._stats["skipped"]["no_bbox"] += 1
             return None
 
-        # Text quality checks (only for OCR, GND doesn't need text content)
-        text_ok = self._check_text_quality(text)
+        # bbox is already 0-1000, use directly
+        bbox_key = f"{int(bbox[0])},{int(bbox[1])},{int(bbox[2])},{int(bbox[3])}"
 
-        # Normalize bbox to [0, 1]
-        bbox_norm = normalize_bbox_pixel_to_01(bbox, img_w, img_h)
-        bbox_str = format_bbox_str(bbox_norm)
+        # Dedup: skip if we've seen this exact bbox in this document
+        if bbox_key in seen_bboxes:
+            self._stats["skipped"]["duplicate"] += 1
+            return None
+        seen_bboxes.add(bbox_key)
 
-        # Decide task based on element type
+        bbox_str = format_bbox_str([int(b) for b in bbox])
+
         text_level = elem.get("text_level", None)
         is_title = text_level == 1
 
-        # GND: locate elements (tables, images, equations, titles)
-        if etype in ("table", "image", "equation") or is_title:
-            question = self._make_gnd_question(etype, text, is_title, doc_id)
+        # --- GND: locate elements ---
+        if etype in gnd_types or is_title:
+            question = self._make_gnd_question(etype, text, is_title)
             if question:
-                idx = hash(f"{doc_id}_{etype}_{bbox}") % (10**8)
+                idx = hash(f"{doc_id}_{etype}_{bbox_key}") % (10**8)
                 sample = make_sample(
                     data_source=f"mineru_{source}_gnd",
                     question=question,
@@ -224,10 +228,20 @@ class MinerUProcessor(DatasetProcessor):
                 )
                 return ("gnd", sample)
 
-        # OCR: read text from elements (text with sufficient quality)
-        if etype in ("text", "equation") and text_ok:
-            question = self._make_ocr_question(etype, bbox_str, is_title, doc_id)
-            idx = hash(f"{doc_id}_ocr_{bbox}") % (10**8)
+        # --- OCR: read text ---
+        if etype in ocr_types:
+            if not self._check_text_quality(text):
+                return None
+
+            # Dedup: skip if we've seen this exact text in this document
+            text_key = text[:100].lower().strip()
+            if text_key in seen_texts:
+                self._stats["skipped"]["duplicate"] += 1
+                return None
+            seen_texts.add(text_key)
+
+            question = self._make_ocr_question(etype, bbox_str, is_title)
+            idx = hash(f"{doc_id}_ocr_{bbox_key}") % (10**8)
             sample = make_sample(
                 data_source=f"mineru_{source}_ocr",
                 question=question,
@@ -243,84 +257,31 @@ class MinerUProcessor(DatasetProcessor):
 
         return None
 
-    def _extract_caption_footnote_samples(self, elem, doc_id, source, image_path, img_w, img_h):
-        """Extract GND/OCR samples from caption and footnote fields."""
-        results = []
-        bbox = elem.get("bbox")
-        if not bbox or len(bbox) != 4:
-            return results
-
-        bbox_norm = normalize_bbox_pixel_to_01(bbox, img_w, img_h)
-        bbox_str = format_bbox_str(bbox_norm)
-
-        # Process captions and footnotes
-        for field, label in [
-            ("table_caption", "table caption"),
-            ("image_caption", "figure caption"),
-            ("table_footnote", "table footnote"),
-            ("image_footnote", "figure footnote"),
-        ]:
-            values = elem.get(field)
-            if not values:
-                continue
-            if isinstance(values, str):
-                values = [values]
-
-            for text in values:
-                text = text.strip()
-                if not self._check_text_quality(text):
-                    continue
-
-                # GND: "Where is the {label}?"
-                question = f'Where is the {label} that reads "{text[:50]}"?'
-                idx = hash(f"{doc_id}_{field}_{text[:30]}") % (10**8)
-                gnd_sample = make_sample(
-                    data_source=f"mineru_{source}_gnd",
-                    question=question,
-                    image_path=image_path,
-                    ground_truth=bbox_str,
-                    task_type="gnd",
-                    dataset=f"mineru_{source}",
-                    split="train",
-                    index=idx,
-                    extra_fields={"element_type": field, "doc_id": doc_id},
-                )
-                results.append(("gnd", gnd_sample))
-
-                # OCR: "Read the {label}"
-                ocr_question = f"Read the {label} near the region {bbox_str} in the document."
-                ocr_sample = make_sample(
-                    data_source=f"mineru_{source}_ocr",
-                    question=ocr_question,
-                    image_path=image_path,
-                    ground_truth=text,
-                    task_type="ocr",
-                    dataset=f"mineru_{source}",
-                    split="train",
-                    index=idx + 1,
-                    extra_fields={"element_type": field, "doc_id": doc_id},
-                )
-                results.append(("ocr", ocr_sample))
-
-        return results
-
     def _check_text_quality(self, text: str) -> bool:
-        """Check if text passes quality filters."""
+        """Stricter text quality filters."""
         if not text:
             self._stats["skipped"]["too_short"] += 1
             return False
-        if len(text) < 3:
+        if len(text) < 5:  # stricter: was 3, now 5
             self._stats["skipped"]["too_short"] += 1
             return False
-        if len(text) > 200:
+        if len(text) > 150:  # stricter: was 200, now 150
             self._stats["skipped"]["too_long"] += 1
             return False
         if is_garbled(text):
             self._stats["skipped"]["garbled"] += 1
             return False
+        if has_latex_noise(text):
+            self._stats["skipped"]["latex_noise"] += 1
+            return False
+        # Must have at least 2 real words
+        words = [w for w in text.split() if len(w) > 1]
+        if len(words) < 2:
+            self._stats["skipped"]["too_short"] += 1
+            return False
         return True
 
-    def _make_gnd_question(self, etype, text, is_title, doc_id):
+    def _make_gnd_question(self, etype, text, is_title):
         """Generate a natural GND question."""
         if etype == "table":
             return "Where is the table in this document?"
@@ -333,7 +294,7 @@ class MinerUProcessor(DatasetProcessor):
             return f'Where is the section titled "{short_text}" in this document?'
         return None
 
-    def _make_ocr_question(self, etype, bbox_str, is_title, doc_id):
+    def _make_ocr_question(self, etype, bbox_str, is_title):
         """Generate a natural OCR question."""
         if is_title:
             return f"Read the heading text at region {bbox_str} in the document."

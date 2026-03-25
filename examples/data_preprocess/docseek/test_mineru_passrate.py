@@ -345,9 +345,20 @@ def main(
     min_pixels: int = 3136,
     output_dir: str = "data/docseek/mineru_scores",
     data_root: str = "/data/151-1/users/yiming/dococr_data",
+    shard_id: int = None,
+    num_shards: int = 1,
 ):
     """
     Test MinerU GND/OCR samples with base model to measure pass rate.
+
+    Multi-GPU parallel:
+        for i in $(seq 0 7); do
+            CUDA_VISIBLE_DEVICES=$i python test_mineru_passrate.py \\
+                --task ocr --shard_id $i --num_shards 8 &
+        done
+        wait
+        # Merge results:
+        cat data/docseek/mineru_scores/ocr_scores_shard*.jsonl > data/docseek/mineru_scores/ocr_scores.jsonl
 
     Args:
         task: "ocr" or "gnd"
@@ -358,6 +369,8 @@ def main(
         min_pixels: Min pixels (4*28*28=3136)
         output_dir: Output directory for scores
         data_root: Root path for dococr_data
+        shard_id: Shard index for multi-GPU parallel (0 to num_shards-1)
+        num_shards: Total number of shards
     """
     if task not in ("ocr", "gnd"):
         print(f"Unknown task: {task}. Use 'ocr' or 'gnd'.")
@@ -375,7 +388,7 @@ def main(
     print(f"Task: {task}, Model: {model}, Samples per item: {num_samples}")
     print(f"Resolution: max_pixels={max_pixels}")
 
-    # Build samples
+    # Build all samples first
     print("\n[Building samples...]")
     samples = build_samples(task, mineru_dirs, image_dirs, max_samples)
 
@@ -383,8 +396,18 @@ def main(
         print("No samples to test.")
         return
 
-    # Run inference
-    output_file = os.path.join(output_dir, f"{task}_scores.jsonl")
+    # Shard if requested
+    if shard_id is not None and num_shards > 1:
+        total = len(samples)
+        shard_size = (total + num_shards - 1) // num_shards
+        start = shard_id * shard_size
+        end = min(start + shard_size, total)
+        samples = samples[start:end]
+        print(f"Shard {shard_id}/{num_shards}: samples [{start}:{end}] = {len(samples)}")
+        output_file = os.path.join(output_dir, f"{task}_scores_shard{shard_id}.jsonl")
+    else:
+        output_file = os.path.join(output_dir, f"{task}_scores.jsonl")
+
     print(f"\n[Running inference on {len(samples)} samples...]")
     run_inference(samples, task, model, num_samples, max_pixels, min_pixels, output_file)
 

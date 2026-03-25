@@ -9,16 +9,16 @@ sources:
     qa_file: "${data_root}/pipeline/formatted/visa_paper_train.jsonl"
     data_root: "${data_root}"
     max_samples: null
-    tasks: ["vqa", "gnd"]
+    tasks: ["vqa"]   # VQA only, no evidence GND
     scores_file: "${data_root}/pipeline/scores/Qwen3-VL-8B-Instruct/paper_visa_scores_v2.jsonl"
-    filter_pass_rate: true   # only keep pass_rate < 1.0
+    filter_pass_rate: true
 
   wiki_visa:
     enabled: true
     qa_file: "${data_root}/pipeline/formatted/visa_wiki_train.jsonl"
     data_root: "${data_root}"
     max_samples: null
-    tasks: ["vqa", "gnd"]
+    tasks: ["vqa"]   # VQA only
     scores_file: "${data_root}/pipeline/scores/Qwen3-VL-8B-Instruct/wiki_visa_scores_v2.jsonl"
     filter_pass_rate: true
 
@@ -29,7 +29,7 @@ sources:
     max_samples: null
     tasks: ["vqa"]
     scores_file: "${data_root}/pipeline/scores/Qwen3-VL-8B-Instruct/vqa_scores.jsonl"
-    scores_id_prefix: "docvqa_train"  # filter scores by id prefix
+    scores_id_prefix: "docvqa_train"
     filter_pass_rate: true
 
   infovqa:
@@ -47,14 +47,26 @@ sources:
     mineru_dirs:
       docvqa: "${data_root}/intermediate/mineru_output"
       infovqa: "${data_root}/intermediate/mineru_infovqa"
+      paper_visa: "${data_root}/intermediate/mineru_visa_paper"
     image_dirs:
       docvqa: "${data_root}/train_source/DocVQA/docvqa_image"
       infovqa: "${data_root}/train_source/InfographicsVQA/images"
+      paper_visa: "${data_root}/train_source/VISA/paper_visa_image"
     tasks: ["gnd", "ocr"]
-    # Pass rate filtering (set true after running test_mineru_passrate.py)
     filter_pass_rate: false
-    gnd_scores_file: null  # "data/docseek/mineru_scores/gnd_scores.jsonl"
-    ocr_scores_file: null  # "data/docseek/mineru_scores/ocr_scores.jsonl"
+    gnd_scores_file: null
+    ocr_scores_file: null
+    # Per-source rules: InfoVQA only text OCR, no table/image GND (irregular infographics)
+    source_rules:
+      infovqa:
+        gnd_types: []           # no GND for infographics
+        ocr_types: ["text"]     # text OCR only
+      docvqa:
+        gnd_types: ["table", "image", "equation"]
+        ocr_types: ["text", "equation"]
+      paper_visa:
+        gnd_types: ["table", "image", "equation"]
+        ocr_types: ["text", "equation"]
 
 # Task ratio in final dataset
 task_ratio:
@@ -69,24 +81,7 @@ vqa_source_ratio:
   docvqa: 0.15
   infovqa: 0.15
 
-# Rule-based filters for MinerU GND/OCR data
-filters:
-  min_text_length: 3
-  max_text_length: 200
-  # Remove elements with very short garbled text
-  min_word_count: 1
-  # Element types to include (from MinerU output)
-  gnd_element_types: ["text", "table", "image", "equation"]
-  ocr_element_types: ["text", "equation"]
-  # Only text_level=1 (titles/headings) for GND by default; null = all levels
-  # Bbox area filters (ratio of element area to full image area)
-  min_bbox_area_ratio: 0.001
-  max_bbox_area_ratio: 0.5
-  # Skip 'discarded' type
-  skip_types: ["discarded"]
-
 # Image resolution control
-# max_pixels controls the maximum pixels for model input.
 # 512*28*28 = 401408 (~400K pixels): good balance for document understanding.
 # Must be consistent across: training, evaluation, and any filtering.
 image:
@@ -98,4 +93,4 @@ output:
   dir: "data/docseek"
   val_size: 100
   seed: 42
-  version: "v1"
+  version: "v2"
