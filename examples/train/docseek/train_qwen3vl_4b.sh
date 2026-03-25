@@ -12,24 +12,24 @@ min_pixels=3136
 
 # RL algorithm
 rl_alg=grpo
-n=4                    # GRPO group size (4 samples per prompt for comparison)
-batch_size=32          # total batch = 8 unique prompts × 4 = 32
-ppo_mini_batch_size=16
+n=8                    # GRPO group size (8 samples per prompt)
+batch_size=64          # total batch = 8 unique prompts × 8 = 64
+ppo_mini_batch_size=32
 
-# GPU config (4×L40S 48GB)
-n_gpus_per_node=4
+# GPU config (3×RTX PRO 6000 Blackwell 98GB)
+n_gpus_per_node=3
 n_nodes=1
-tensor_model_parallel_size=1  # 4B fits on single L40S
-gpu_memory_utilization=0.7    # conservative for L40S
-do_offload=True               # FSDP param + optimizer offload
+tensor_model_parallel_size=1  # 4B fits on single 98GB easily
+gpu_memory_utilization=0.85   # 98GB, plenty of room
+do_offload=False              # NO offload needed — 98GB per card
 strategy="fsdp2"
 fsdp_size=-1
 ulysses_sequence_parallel_size=1
 
-# Sequence lengths
-max_prompt_length=16384       # image tokens can be large
-max_response_length=8192      # VQA answers are short
-max_obs_length=8192
+# Sequence lengths (tuned based on actual usage: prompt max~4200, response max~4100)
+max_prompt_length=6144        # actual max ~4126, leave headroom
+max_response_length=4096      # actual max ~4041
+max_obs_length=4096
 ppo_max_token_len_per_gpu=$(expr $max_prompt_length + $max_response_length)
 
 # Agent / tool config
@@ -51,7 +51,7 @@ kl_loss_type=low_var_kl
 
 # Micro batch (per GPU)
 ppo_micro_batch_size_per_gpu=1
-log_prob_micro_batch_size_per_gpu=4
+log_prob_micro_batch_size_per_gpu=8
 
 # Reward
 reward_manager=docseek
@@ -72,7 +72,7 @@ run_name="${reward_manager}-${strategy}-agent-${model_pretty_name}-${rl_alg}-n${
 export VERL_RUN_ID=$run_name
 export NCCL_DEBUG=WARN
 export VLLM_USE_V1=1
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=1,2,3
 
 # Action stop tokens temp file
 action_stop_tokens_file="$(pwd)$(mktemp)"
