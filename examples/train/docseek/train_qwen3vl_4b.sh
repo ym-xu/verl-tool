@@ -13,8 +13,8 @@ min_pixels=3136
 # RL algorithm
 rl_alg=grpo
 n=8                    # GRPO group size (8 samples per prompt)
-batch_size=64          # total batch = 8 unique prompts × 8 = 64
-ppo_mini_batch_size=32
+batch_size=48          # total batch = 6 unique prompts × 8 = 48 (divisible by 3 GPUs)
+ppo_mini_batch_size=24
 
 # GPU config (3×RTX PRO 6000 Blackwell 98GB)
 n_gpus_per_node=3
