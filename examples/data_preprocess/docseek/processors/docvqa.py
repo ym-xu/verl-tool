@@ -1,92 +1,100 @@
-"""DocVQA processor. Produces VQA samples only."""
+"""DocVQA processor. Reads from local files + scores for hard case filtering."""
 import os
 import json
 import datasets
 from typing import Dict
 from .base import DatasetProcessor
-from ..utils import save_image, make_sample
+from ..utils import make_sample
 
 
 class DocVQAProcessor(DatasetProcessor):
 
     def __init__(self, name: str, config: dict, output_dir: str):
         super().__init__(name, config, output_dir)
-        self.hf_path = config["hf_path"]
-        self.split = config.get("split", "train")
+        self.image_dir = config["image_dir"]
+        self.qa_file = config["qa_file"]
         self.max_samples = config.get("max_samples", None)
-        self.hard_case_only = config.get("hard_case_only", False)
-        self.hard_case_threshold = config.get("hard_case_threshold", 0.8)
-        self.hard_case_scores_file = config.get("hard_case_scores_file", None)
-        self.image_dir = os.path.join(output_dir, "images", name)
-        self._hard_scores = None
-        self._stats = {"name": name, "raw_count": 0, "after_hard_filter": 0, "vqa_count": 0}
+        self.filter_pass_rate = config.get("filter_pass_rate", False)
+        self.scores_file = config.get("scores_file", None)
+        self.scores_id_prefix = config.get("scores_id_prefix", None)
+        self._stats = {"name": name, "raw_count": 0, "after_filter": 0, "vqa_count": 0}
 
-    def _load_hard_scores(self):
-        if self._hard_scores is not None:
-            return
-        if self.hard_case_scores_file and os.path.exists(self.hard_case_scores_file):
-            self._hard_scores = {}
-            with open(self.hard_case_scores_file, 'r') as f:
-                for line in f:
-                    item = json.loads(line)
-                    self._hard_scores[item["index"]] = item["score"]
-            print(f"  Loaded {len(self._hard_scores)} hard case scores from {self.hard_case_scores_file}")
-        else:
-            self._hard_scores = {}
+    def _load_scores(self) -> Dict[str, float]:
+        """Load pass_rate scores, filtered by id prefix."""
+        scores = {}
+        if not self.scores_file or not os.path.exists(self.scores_file):
+            return scores
+        with open(self.scores_file, 'r') as f:
+            for line in f:
+                item = json.loads(line)
+                sid = item["id"]
+                if self.scores_id_prefix and not sid.startswith(self.scores_id_prefix):
+                    continue
+                scores[sid] = item["pass_rate"]
+        print(f"  Loaded {len(scores)} scores (prefix={self.scores_id_prefix})")
+        return scores
+
+    def _load_qa(self):
+        """Load QA data from local JSON file."""
+        with open(self.qa_file, 'r') as f:
+            data = json.load(f)
+        return data["data"]
 
     def load(self) -> datasets.Dataset:
-        split_name = "train" if self.split == "train" else "validation"
-        ds = datasets.load_dataset(self.hf_path, split=split_name)
-        if self.max_samples:
-            ds = ds.select(range(min(self.max_samples, len(ds))))
-        self._stats["raw_count"] = len(ds)
-        return ds
+        return None  # not used, we process directly
 
     def process(self) -> Dict[str, datasets.Dataset]:
-        raw_ds = self.load()
+        qa_data = self._load_qa()
+        self._stats["raw_count"] = len(qa_data)
 
-        if self.hard_case_only:
-            self._load_hard_scores()
-            if self._hard_scores:
-                raw_ds = raw_ds.filter(
-                    lambda x, idx: self._hard_scores.get(idx, 1.0) < self.hard_case_threshold,
-                    with_indices=True,
-                    num_proc=8,
-                )
-                self._stats["after_hard_filter"] = len(raw_ds)
-                print(f"  {self.name}: {self._stats['raw_count']} → {len(raw_ds)} after hard case filter")
-            else:
-                print(f"  {self.name}: hard_case_only=True but no scores file, using all data")
-                self._stats["after_hard_filter"] = len(raw_ds)
+        # Load scores for filtering
+        scores = self._load_scores() if self.filter_pass_rate else {}
 
-        vqa_ds = raw_ds.map(
-            self._make_vqa_sample,
-            with_indices=True,
-            remove_columns=raw_ds.column_names,
-            num_proc=16,
-            desc=f"{self.name} VQA",
-        )
-        self._stats["vqa_count"] = len(vqa_ds)
+        samples = []
+        for i, item in enumerate(qa_data):
+            if self.max_samples and i >= self.max_samples:
+                break
+
+            # Resolve image path
+            image_name = os.path.basename(item["image"])
+            # DocVQA image field is "documents/xnbl0037_1.png"
+            # but local images are stored directly as "xnbl0037_1.png"
+            image_path = os.path.join(self.image_dir, image_name)
+            if not os.path.exists(image_path):
+                continue
+
+            # Hard case filter by pass_rate
+            if self.filter_pass_rate and scores:
+                score_id = f"{self.scores_id_prefix}_{i:05d}"
+                pass_rate = scores.get(score_id, None)
+                if pass_rate is not None and pass_rate >= 1.0:
+                    continue  # skip trivial cases
+
+            answers = item.get("answers", [])
+            if isinstance(answers, str):
+                answers = [answers]
+
+            sample = make_sample(
+                data_source="docvqa",
+                question=item["question"],
+                image_path=image_path,
+                ground_truth=answers,
+                task_type="vqa",
+                dataset="docvqa",
+                split="train",
+                index=i,
+            )
+            samples.append(sample)
+
+        self._stats["after_filter"] = len(samples)
+        self._stats["vqa_count"] = len(samples)
+        print(f"  {self.name}: {self._stats['raw_count']} → {len(samples)} after filtering")
+
+        if not samples:
+            return {"vqa": datasets.Dataset.from_dict({})}
+
+        vqa_ds = datasets.Dataset.from_list(samples)
         return {"vqa": vqa_ds}
-
-    def _make_vqa_sample(self, example, idx):
-        image_path = os.path.join(self.image_dir, f"{self.split}_{idx}.png")
-        save_image(example["image"], image_path)
-
-        answers = example.get("answers", [example.get("answer", "")])
-        if isinstance(answers, str):
-            answers = [answers]
-
-        return make_sample(
-            data_source=self.name,
-            question=example["question"],
-            image_path=image_path,
-            ground_truth=answers,
-            task_type="vqa",
-            dataset=self.name,
-            split=self.split,
-            index=idx,
-        )
 
     def get_stats(self) -> dict:
         return self._stats

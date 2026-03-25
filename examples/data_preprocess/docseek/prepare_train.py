@@ -8,10 +8,11 @@ applies ratio sampling, and outputs train/val parquets.
 Usage:
     python prepare_train.py
     python prepare_train.py --config custom_config.yaml
-    python prepare_train.py --config config.yaml --override sources.docvqa.enabled=false
+    python prepare_train.py --datasets_to_include=docvqa,infovqa,paper_visa,wiki_visa
 """
 import fire
 import os
+import re
 import datasets
 import json
 from pathlib import Path
@@ -19,7 +20,7 @@ from collections import defaultdict
 from typing import Dict, List
 
 from utils import load_config, save_stats
-from processors import VISAProcessor, DocVQAProcessor, InfoVQAProcessor
+from processors import VISAProcessor, DocVQAProcessor, InfoVQAProcessor, MinerUProcessor
 
 
 PROCESSOR_MAP = {
@@ -27,8 +28,19 @@ PROCESSOR_MAP = {
     "wiki_visa": VISAProcessor,
     "docvqa": DocVQAProcessor,
     "infovqa": InfoVQAProcessor,
-    # "mineru_gnd_ocr": MinerUProcessor,  # Phase B
+    "mineru_gnd_ocr": MinerUProcessor,
 }
+
+
+def resolve_config_vars(cfg: dict, data_root: str) -> dict:
+    """Recursively replace ${data_root} in config values."""
+    if isinstance(cfg, dict):
+        return {k: resolve_config_vars(v, data_root) for k, v in cfg.items()}
+    elif isinstance(cfg, list):
+        return [resolve_config_vars(v, data_root) for v in cfg]
+    elif isinstance(cfg, str):
+        return cfg.replace("${data_root}", data_root)
+    return cfg
 
 
 def sample_by_ratio(task_datasets: Dict[str, List[datasets.Dataset]],
@@ -42,7 +54,6 @@ def sample_by_ratio(task_datasets: Dict[str, List[datasets.Dataset]],
     all_samples = []
     stats = {}
 
-    # Determine total dataset size (use all available data, apply ratios as weights)
     total_available = sum(
         sum(len(ds) for ds in ds_list)
         for ds_list in task_datasets.values()
@@ -55,11 +66,9 @@ def sample_by_ratio(task_datasets: Dict[str, List[datasets.Dataset]],
 
         task_total = sum(len(ds) for ds in ds_list)
         target_count = int(total_available * task_weight)
-        # Don't upsample: cap at available
         target_count = min(target_count, task_total)
 
         if task_type == "vqa" and vqa_source_ratio:
-            # Sub-sample VQA by source
             for ds in ds_list:
                 if len(ds) == 0:
                     continue
@@ -73,7 +82,6 @@ def sample_by_ratio(task_datasets: Dict[str, List[datasets.Dataset]],
                 all_samples.append(sampled)
                 stats[f"{task_type}/{source_name}"] = source_target
         else:
-            # For GND/OCR: merge all sources, sample proportionally
             merged_task = datasets.concatenate_datasets(ds_list)
             target_count = min(target_count, len(merged_task))
             sampled = merged_task.shuffle(seed=seed).select(range(target_count))
@@ -94,13 +102,26 @@ def sample_by_ratio(task_datasets: Dict[str, List[datasets.Dataset]],
     return merged
 
 
-def main(config: str = "config.yaml"):
-    """Run the data preparation pipeline."""
-    # Load config
+def main(
+    config: str = "config.yaml",
+    datasets_to_include: str = None,
+):
+    """Run the data preparation pipeline.
+
+    Args:
+        config: Path to config YAML file.
+        datasets_to_include: Comma-separated list of sources to include.
+            If None, uses 'enabled' flag in config.
+            E.g., "docvqa,infovqa,paper_visa,wiki_visa,mineru_gnd_ocr"
+    """
     config_path = Path(config)
     if not config_path.exists():
         config_path = Path(__file__).parent / config
     cfg = load_config(str(config_path))
+
+    # Resolve ${data_root} in all paths
+    data_root = cfg.get("data_root", "")
+    cfg = resolve_config_vars(cfg, data_root)
 
     output_dir = cfg["output"]["dir"]
     val_size = cfg["output"]["val_size"]
@@ -109,12 +130,21 @@ def main(config: str = "config.yaml"):
 
     os.makedirs(output_dir, exist_ok=True)
 
+    # Determine which sources to process
+    include_set = None
+    if datasets_to_include:
+        include_set = set(s.strip() for s in datasets_to_include.split(","))
+
     # Process each enabled source
     task_datasets: Dict[str, List[datasets.Dataset]] = defaultdict(list)
     all_stats = {}
 
     for source_name, source_cfg in cfg["sources"].items():
-        if not source_cfg.get("enabled", False):
+        if include_set:
+            if source_name not in include_set:
+                print(f"[SKIP] {source_name} (not in --datasets_to_include)")
+                continue
+        elif not source_cfg.get("enabled", False):
             print(f"[SKIP] {source_name} (disabled)")
             continue
 
@@ -133,8 +163,9 @@ def main(config: str = "config.yaml"):
         all_stats[source_name] = processor.get_stats()
 
         for task_type, ds in result.items():
-            task_datasets[task_type].append(ds)
-            print(f"  {task_type}: {len(ds)} samples")
+            if len(ds) > 0:
+                task_datasets[task_type].append(ds)
+                print(f"  {task_type}: {len(ds)} samples")
 
     if not any(task_datasets.values()):
         print("\nNo data produced. Check config sources.")
@@ -176,8 +207,6 @@ def main(config: str = "config.yaml"):
     all_stats["final"] = {
         "train_count": len(train_ds),
         "val_count": len(val_ds) if val_ds else 0,
-        "task_distribution": dict(train_ds.to_pandas()["extra_info"].apply(lambda x: x["task_type"]).value_counts()),
-        "source_distribution": dict(train_ds.to_pandas()["data_source"].value_counts()),
     }
     save_stats(all_stats, str(out_dir / "data_stats.json"))
 
@@ -186,7 +215,8 @@ def main(config: str = "config.yaml"):
     sample = train_ds[0]
     print(f"  data_source: {sample['data_source']}")
     print(f"  task_type: {sample['extra_info']['task_type']}")
-    print(f"  question: {sample['prompt'][1]['content'][:100]}...")
+    user_msg = sample['prompt'][1]['content'] if len(sample['prompt']) > 1 else ""
+    print(f"  question: {user_msg[:100]}...")
     print(f"  ground_truth: {sample['reward_model']['ground_truth']}")
 
 
