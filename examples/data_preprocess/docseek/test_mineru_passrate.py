@@ -35,7 +35,7 @@ from tqdm import tqdm
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parents[3]))
 from verl_tool.workers.reward_manager.reward_score.doc_metrics import (
-    compute_anls, compute_iou_from_str
+    compute_anls, compute_iou
 )
 
 
@@ -277,11 +277,14 @@ def run_inference(samples, task, model_name, num_samples, max_pixels, min_pixels
                     passed = score > 0  # ANLS > 0 means at least partially correct
                 elif task == "gnd":
                     try:
-                        iou = compute_iou_from_str(answer, sample["ground_truth"])
+                        # Parse bbox from strings like "[0.1, 0.2, 0.3, 0.4]"
+                        import ast
+                        pred_bbox = ast.literal_eval(answer)
+                        gt_bbox = ast.literal_eval(sample["ground_truth"])
+                        iou = compute_iou(pred_bbox, gt_bbox)
                         passed = iou >= 0.5
                     except Exception:
                         passed = False
-                        iou = 0.0
 
                 scores_list.append(1 if passed else 0)
 
