@@ -133,7 +133,10 @@ def main(
     # Determine which sources to process
     include_set = None
     if datasets_to_include:
-        include_set = set(s.strip() for s in datasets_to_include.split(","))
+        if isinstance(datasets_to_include, (list, tuple)):
+            include_set = set(datasets_to_include)
+        else:
+            include_set = set(s.strip() for s in str(datasets_to_include).split(","))
 
     # Process each enabled source
     task_datasets: Dict[str, List[datasets.Dataset]] = defaultdict(list)
