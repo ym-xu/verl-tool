@@ -90,11 +90,16 @@ def extract_fields(row) -> dict:
 
     images = row.get("images", [])
     image_path = ""
-    if isinstance(images, list) and images:
-        if isinstance(images[0], dict):
-            image_path = images[0].get("image", "")
-        elif isinstance(images[0], str):
-            image_path = images[0]
+    # images can be list or numpy array
+    try:
+        if len(images) > 0:
+            item = images[0]
+            if isinstance(item, dict):
+                image_path = item.get("image", "")
+            elif isinstance(item, str):
+                image_path = item
+    except (TypeError, KeyError):
+        pass
 
     gt = reward.get("ground_truth", "") if isinstance(reward, dict) else ""
     task_type = extra.get("task_type", "unknown") if isinstance(extra, dict) else "unknown"
