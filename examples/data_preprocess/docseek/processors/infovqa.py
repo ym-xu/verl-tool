@@ -4,7 +4,10 @@ import json
 import datasets
 from typing import Dict
 from .base import DatasetProcessor
-from ..utils import make_sample
+try:
+    from ..utils import make_sample
+except ImportError:
+    from utils import make_sample
 
 
 class InfoVQAProcessor(DatasetProcessor):

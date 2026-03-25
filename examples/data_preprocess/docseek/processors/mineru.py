@@ -23,7 +23,10 @@ import re
 import datasets
 from typing import Dict, List, Optional, Tuple
 from .base import DatasetProcessor
-from ..utils import make_sample, normalize_bbox_pixel_to_01, format_bbox_str
+try:
+    from ..utils import make_sample, normalize_bbox_pixel_to_01, format_bbox_str
+except ImportError:
+    from utils import make_sample, normalize_bbox_pixel_to_01, format_bbox_str
 
 
 def is_garbled(text: str, threshold: float = 0.3) -> bool:
