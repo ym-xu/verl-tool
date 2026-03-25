@@ -294,59 +294,65 @@ body { font-family: -apple-system, 'Segoe UI', sans-serif; background: var(--bg)
     </div>
 </div>
 <script>
-let allSamples = [];
-let filtered = [];
-let ci = 0;  // current index
+let totalCount = 0;
+let filteredIndices = [];
+let ci = 0;  // position in filteredIndices
+let currentSample = null;
 let userBbox = null;
 let drawing = false;
 let drawStart = null;
+let badCount = 0;
 
 async function init() {
-    const r = await fetch('/api/samples');
-    allSamples = await r.json();
-    // Populate filters
+    const r = await fetch('/api/meta');
+    const meta = await r.json();
+    totalCount = meta.total;
     const add = (id, vals) => { const el = document.getElementById(id); vals.forEach(v => { const o = document.createElement('option'); o.value = v; o.textContent = v; el.appendChild(o); }); };
-    add('f-source', [...new Set(allSamples.map(s => s.data_source))].sort());
-    add('f-task', [...new Set(allSamples.map(s => s.task_type))].sort());
-    add('f-elem', [...new Set(allSamples.map(s => s.element_type).filter(Boolean))].sort());
+    add('f-source', meta.sources);
+    add('f-task', meta.tasks);
+    add('f-elem', meta.elements);
     applyFilters();
 }
 
-function applyFilters() {
+async function applyFilters() {
+    const p = new URLSearchParams();
     const src = document.getElementById('f-source').value;
     const task = document.getElementById('f-task').value;
     const elem = document.getElementById('f-elem').value;
     const label = document.getElementById('f-label').value;
-    const search = document.getElementById('f-search').value.toLowerCase();
-    filtered = allSamples.filter(s => {
-        if (src && s.data_source !== src) return false;
-        if (task && s.task_type !== task) return false;
-        if (elem && s.element_type !== elem) return false;
-        if (label === 'bad' && s.label !== 'bad') return false;
-        if (label === 'unlabeled' && s.label === 'bad') return false;
-        if (search && !s.question.toLowerCase().includes(search) && !s.ground_truth.toLowerCase().includes(search)) return false;
-        return true;
-    });
-    const tc = {}; filtered.forEach(s => { tc[s.task_type] = (tc[s.task_type]||0)+1; });
-    const bad = filtered.filter(s => s.label === 'bad').length;
+    const search = document.getElementById('f-search').value;
+    if (src) p.set('source', src);
+    if (task) p.set('task', task);
+    if (elem) p.set('element', elem);
+    if (label) p.set('label', label);
+    if (search) p.set('q', search);
+    const r = await fetch('/api/filtered?' + p.toString());
+    const data = await r.json();
+    filteredIndices = data.indices;
     document.getElementById('stats').innerHTML =
-        `Showing <b>${filtered.length}</b>/${allSamples.length} | ` +
-        Object.entries(tc).map(([k,v]) => `${k}:<b>${v}</b>`).join(' ') +
-        ` | Bad:<b style="color:var(--red)">${bad}</b>`;
+        `Showing <b>${filteredIndices.length}</b> / ${totalCount}`;
     ci = 0;
-    render();
+    loadCurrent();
 }
 
-function go(d) { if (!filtered.length) return; ci = Math.max(0, Math.min(filtered.length-1, ci+d)); render(); }
-function goRandom() { if (!filtered.length) return; ci = Math.floor(Math.random()*filtered.length); render(); }
+function go(d) { if (!filteredIndices.length) return; ci = Math.max(0, Math.min(filteredIndices.length-1, ci+d)); loadCurrent(); }
+function goRandom() { if (!filteredIndices.length) return; ci = Math.floor(Math.random()*filteredIndices.length); loadCurrent(); }
 
-function render() {
-    if (!filtered.length) {
+async function loadCurrent() {
+    if (!filteredIndices.length) {
         document.getElementById('pos').textContent = '0 / 0';
         return;
     }
-    const s = filtered[ci];
-    document.getElementById('pos').textContent = `${ci+1} / ${filtered.length}  (#${s.index})`;
+    const idx = filteredIndices[ci];
+    const r = await fetch('/api/sample?index=' + idx);
+    currentSample = await r.json();
+    render();
+}
+
+function render() {
+    const s = currentSample;
+    if (!s) return;
+    document.getElementById('pos').textContent = `${ci+1} / ${filteredIndices.length}  (#${s.index})`;
 
     // Image
     const img = document.getElementById('doc-img');
@@ -390,8 +396,7 @@ function render() {
         btn.onclick = markBad;
     }
 
-    document.getElementById('bad-count').textContent =
-        `Bad: ${allSamples.filter(s=>s.label==='bad').length}`;
+    document.getElementById('bad-count').textContent = `Bad: ${badCount}`;
 }
 
 function drawBbox(s) {
@@ -427,47 +432,42 @@ function drawBbox(s) {
 }
 
 async function markBad() {
-    if (!filtered.length) return;
-    const s = filtered[ci];
+    if (!currentSample) return;
     const r = await fetch('/api/label', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({index: s.index, label: 'bad'})
+        body: JSON.stringify({index: currentSample.index, label: 'bad'})
     });
     if ((await r.json()).ok) {
-        s.label = 'bad';
-        // Also update in allSamples
-        allSamples[s.index].label = 'bad';
+        currentSample.label = 'bad';
+        badCount++;
         go(1);
     }
 }
 
 async function undoBad() {
-    if (!filtered.length) return;
-    const s = filtered[ci];
+    if (!currentSample) return;
     const r = await fetch('/api/label', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({index: s.index, label: ''})
+        body: JSON.stringify({index: currentSample.index, label: ''})
     });
     if ((await r.json()).ok) {
-        s.label = '';
-        allSamples[s.index].label = '';
+        currentSample.label = '';
+        badCount = Math.max(0, badCount - 1);
         render();
     }
 }
 
 async function saveBbox() {
-    if (!userBbox || !filtered.length) return;
-    const s = filtered[ci];
+    if (!userBbox || !currentSample) return;
     const r = await fetch('/api/save_bbox', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({index: s.index, bbox: userBbox})
+        body: JSON.stringify({index: currentSample.index, bbox: userBbox})
     });
     if ((await r.json()).ok) {
-        s.bbox = userBbox;
-        allSamples[s.index].bbox = userBbox;
+        currentSample.bbox = userBbox;
         clearDraw();
         render();
     }
@@ -567,8 +567,42 @@ class Handler(SimpleHTTPRequestHandler):
         params = parse_qs(parsed.query)
         if p == "/" or p == "/index.html":
             self._html()
-        elif p == "/api/samples":
-            self._json(SAMPLES)
+        elif p == "/api/meta":
+            # Lightweight: only unique filter values + total count
+            sources = sorted(set(s["data_source"] for s in SAMPLES))
+            tasks = sorted(set(s["task_type"] for s in SAMPLES))
+            elems = sorted(set(s["element_type"] for s in SAMPLES if s["element_type"]))
+            self._json({"total": len(SAMPLES), "sources": sources, "tasks": tasks, "elements": elems})
+        elif p == "/api/sample":
+            # Single sample by index
+            idx = int(params.get("index", [0])[0])
+            if 0 <= idx < len(SAMPLES):
+                self._json(SAMPLES[idx])
+            else:
+                self._json({"error": "out of range"})
+        elif p == "/api/filtered":
+            # Server-side filtering, return indices only
+            src = params.get("source", [""])[0]
+            task = params.get("task", [""])[0]
+            elem = params.get("element", [""])[0]
+            label = params.get("label", [""])[0]
+            kw = params.get("q", [""])[0].lower()
+            indices = []
+            for s in SAMPLES:
+                if src and s["data_source"] != src:
+                    continue
+                if task and s["task_type"] != task:
+                    continue
+                if elem and s["element_type"] != elem:
+                    continue
+                if label == "bad" and s["label"] != "bad":
+                    continue
+                if label == "unlabeled" and s["label"] == "bad":
+                    continue
+                if kw and kw not in s["question"].lower() and kw not in s["ground_truth"].lower():
+                    continue
+                indices.append(s["index"])
+            self._json({"indices": indices, "count": len(indices)})
         elif p == "/api/image":
             self._image(params)
         else:
