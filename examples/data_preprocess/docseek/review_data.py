@@ -1,368 +1,677 @@
+#!/usr/bin/env python3
 """
-DocSeek Training Data Quality Studio.
-Run:
-    streamlit run review_data.py -- --parquet data/docseek/v2/train.parquet
+DocSeek Data Quality Viewer — Web-based visual inspection for training data.
+Displays document images with bbox overlays, question/GT, and labeling controls.
+
+Usage:
+    python review_data.py --parquet data/docseek/v2/train.parquet --port 8899
+
+Then open http://<server>:8899 in your browser.
+Keyboard: ← → navigate | R random | B mark bad | Space next
 """
 from __future__ import annotations
+import argparse
 import json
+import mimetypes
+import os
 import re
-import sys
 import time
+from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
-from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 
-import pandas as pd
-import streamlit as st
-from PIL import Image, ImageDraw
-
-
-# ─── Page ────────────────────────────────────────────────────────────────────
-
-def init_page():
-    st.set_page_config(page_title="DocSeek Quality Studio", page_icon="🔍",
-                       layout="wide", initial_sidebar_state="expanded")
-    st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
-.stApp {
-    background: radial-gradient(1200px 400px at 0% 0%, rgba(255,186,104,0.16), transparent 55%),
-                radial-gradient(1000px 400px at 100% 0%, rgba(110,186,255,0.16), transparent 55%),
-                linear-gradient(180deg, #f6f8fb 0%, #eef2f7 100%);
-}
-h1,h2,h3,h4,h5,h6,body,.stMarkdown,.stText {font-family:"Space Grotesk",sans-serif!important}
-code,pre {font-family:"IBM Plex Mono",monospace!important}
-[data-testid="stSidebar"] {background:linear-gradient(180deg,#0f1729,#132a45)}
-[data-testid="stSidebar"] * {color:#f2f6ff!important}
-.hero-card {
-    background:linear-gradient(145deg,rgba(9,31,57,0.93),rgba(20,74,122,0.92));
-    border:1px solid rgba(255,255,255,0.08); border-radius:18px;
-    padding:16px 18px; color:#f6fbff;
-    box-shadow:0 12px 32px rgba(10,25,45,0.18); margin-bottom:1rem;
-}
-.label-bad {background:#dc2626;color:white;padding:2px 10px;border-radius:6px;font-weight:600}
-</style>""", unsafe_allow_html=True)
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+SAMPLES: list[dict] = []
+LABELS: dict[int, dict] = {}
+LABELS_PATH: str = ""
 
 
-# ─── Data ────────────────────────────────────────────────────────────────────
+def load_parquet(path: str) -> list[dict]:
+    import pandas as pd
+    df = pd.read_parquet(path)
+    samples = []
+    for i in range(len(df)):
+        row = df.iloc[i].to_dict()
+        prompt = row.get("prompt", [])
+        extra = row.get("extra_info", {})
+        reward = row.get("reward_model", {})
 
-@st.cache_data(show_spinner="Loading data...")
-def load_parquet(path: str) -> pd.DataFrame:
-    return pd.read_parquet(path)
+        question = ""
+        if isinstance(prompt, list) and len(prompt) > 1:
+            question = prompt[1].get("content", "")
 
+        images = row.get("images", [])
+        image_path = ""
+        try:
+            if len(images) > 0:
+                item = images[0]
+                if isinstance(item, dict):
+                    image_path = item.get("image", "")
+                elif isinstance(item, str):
+                    image_path = item
+        except (TypeError, KeyError):
+            pass
 
-def extract_fields(row) -> dict:
-    prompt = row.get("prompt", [])
-    extra = row.get("extra_info", {})
-    reward = row.get("reward_model", {})
+        gt = reward.get("ground_truth", "") if isinstance(reward, dict) else ""
+        task_type = extra.get("task_type", "unknown") if isinstance(extra, dict) else "unknown"
+        element_type = extra.get("element_type", "") if isinstance(extra, dict) else ""
+        doc_id = extra.get("doc_id", "") if isinstance(extra, dict) else ""
+        data_source = row.get("data_source", "")
 
-    question = ""
-    if isinstance(prompt, list) and len(prompt) > 1:
-        question = prompt[1].get("content", "")
-
-    images = row.get("images", [])
-    image_path = ""
-    try:
-        if len(images) > 0:
-            item = images[0]
-            if isinstance(item, dict):
-                image_path = item.get("image", "")
-            elif isinstance(item, str):
-                image_path = item
-    except (TypeError, KeyError):
-        pass
-
-    gt = reward.get("ground_truth", "") if isinstance(reward, dict) else ""
-    task_type = extra.get("task_type", "unknown") if isinstance(extra, dict) else "unknown"
-    element_type = extra.get("element_type", "") if isinstance(extra, dict) else ""
-    doc_id = extra.get("doc_id", "") if isinstance(extra, dict) else ""
-
-    return dict(data_source=row.get("data_source", ""), task_type=task_type,
-                element_type=element_type, doc_id=doc_id, question=question,
-                ground_truth=gt, image_path=image_path)
-
-
-def extract_bbox(fields: dict) -> Optional[list[int]]:
-    bbox = None
-    if fields["task_type"] == "gnd":
-        gt = fields["ground_truth"]
-        if isinstance(gt, str):
+        # Extract bbox
+        bbox = None
+        if task_type == "gnd" and isinstance(gt, str):
             nums = re.findall(r"-?\d+(?:\.\d+)?", gt)
             if len(nums) >= 4:
                 bbox = [int(float(n)) for n in nums[:4]]
-    elif fields["task_type"] == "ocr":
-        match = re.search(r"region\s*\[([^\]]+)\]", fields["question"])
-        if match:
-            nums = [n.strip() for n in match.group(1).split(",")]
-            if len(nums) >= 4:
-                try:
-                    bbox = [int(float(n)) for n in nums[:4]]
-                except ValueError:
-                    pass
-    return bbox
+        elif task_type == "ocr":
+            match = re.search(r"region\s*\[([^\]]+)\]", question)
+            if match:
+                nums = [n.strip() for n in match.group(1).split(",")]
+                if len(nums) >= 4:
+                    try:
+                        bbox = [int(float(n)) for n in nums[:4]]
+                    except ValueError:
+                        pass
+
+        # Clean question for display
+        q_display = question.replace("<image>\n", "").strip()
+        parts = q_display.split("Guidelines:")
+        q_short = parts[0].strip()
+        guidelines = parts[1].strip() if len(parts) > 1 else ""
+
+        samples.append({
+            "index": i,
+            "data_source": data_source,
+            "task_type": task_type,
+            "element_type": element_type or "",
+            "doc_id": doc_id or "",
+            "question": q_short,
+            "guidelines": guidelines,
+            "ground_truth": gt if isinstance(gt, str) else json.dumps(gt, ensure_ascii=False),
+            "image_path": image_path,
+            "bbox": bbox,
+            "label": "",
+        })
+    return samples
 
 
-def draw_bbox_on_image(image: Image.Image, bbox: list[int], color: str,
-                       label: str = "") -> Image.Image:
-    img = image.copy()
-    draw = ImageDraw.Draw(img)
-    w, h = img.size
-    x1, y1 = int(bbox[0]/1000*w), int(bbox[1]/1000*h)
-    x2, y2 = int(bbox[2]/1000*w), int(bbox[3]/1000*h)
-    draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
-    if label:
-        ty = max(0, y1 - 22)
-        draw.rectangle([x1, ty, x1+len(label)*9+8, ty+20], fill=color)
-        draw.text((x1+4, ty+2), label, fill="white")
-    return img
+def load_labels(path: str) -> dict[int, dict]:
+    labels = {}
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    item = json.loads(line)
+                    labels[item["index"]] = item
+    return labels
 
 
-# ─── Labels ──────────────────────────────────────────────────────────────────
-
-def labels_path(parquet_path: str) -> Path:
-    return Path(parquet_path).parent / "quality_labels.jsonl"
-
-
-def load_labels(parquet_path: str) -> dict[int, dict]:
-    lp = labels_path(parquet_path)
-    out = {}
-    if lp.exists():
-        for line in lp.read_text().strip().split("\n"):
-            if line.strip():
-                item = json.loads(line)
-                out[item["index"]] = item
-    return out
+def save_label(index: int, label: str, corrected_bbox=None, note: str = ""):
+    entry = {
+        "index": index, "label": label,
+        "corrected_bbox": corrected_bbox, "note": note,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    LABELS[index] = entry
+    with open(LABELS_PATH, "a") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def save_label(parquet_path: str, index: int, label: str,
-               corrected_bbox=None, note: str = ""):
-    with open(labels_path(parquet_path), "a") as f:
-        f.write(json.dumps(dict(index=index, label=label,
-                corrected_bbox=corrected_bbox, note=note,
-                timestamp=time.strftime("%Y-%m-%d %H:%M:%S")),
-                ensure_ascii=False) + "\n")
+# ---------------------------------------------------------------------------
+# HTML
+# ---------------------------------------------------------------------------
+HTML_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DocSeek Quality Studio</title>
+<style>
+:root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #21262d;
+    --text: #c9d1d9; --text2: #8b949e; --accent: #58a6ff;
+    --green: #3fb950; --red: #f85149; --orange: #d29922;
+    --border: #30363d;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); }
+.header {
+    background: var(--bg2); border-bottom: 1px solid var(--border);
+    padding: 12px 24px; display: flex; align-items: center; gap: 20px;
+    flex-wrap: wrap; position: sticky; top: 0; z-index: 100;
+}
+.header h1 { font-size: 18px; color: var(--accent); white-space: nowrap; }
+.stats { font-size: 13px; color: var(--text2); }
+.stats b { color: var(--text); }
+.filters {
+    background: var(--bg2); border-bottom: 1px solid var(--border);
+    padding: 10px 24px; display: flex; gap: 12px; flex-wrap: wrap; align-items: center;
+}
+.filters label { font-size: 12px; color: var(--text2); }
+.filters select, .filters input {
+    background: var(--bg3); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 8px; font-size: 13px;
+}
+.nav {
+    background: var(--bg2); border-bottom: 1px solid var(--border);
+    padding: 8px 24px; display: flex; gap: 8px; align-items: center;
+}
+.nav button {
+    background: var(--bg3); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px;
+}
+.nav button:hover { background: var(--border); }
+.nav .pos { font-size: 13px; color: var(--text2); margin: 0 8px; }
+.btn-bad {
+    background: var(--red) !important; color: #fff !important;
+    border: none !important; font-weight: 600; padding: 6px 18px !important;
+}
+.btn-bad:hover { opacity: 0.85; }
+.btn-undo {
+    background: var(--bg3) !important; color: var(--green) !important;
+    border: 1px solid var(--green) !important;
+}
+.main { display: flex; height: calc(100vh - 140px); }
+.left-panel { flex: 0 0 55%; max-width: 55%; overflow: auto; padding: 16px; }
+.right-panel { flex: 1; overflow: auto; padding: 16px; border-left: 1px solid var(--border); }
+.img-container {
+    position: relative; display: inline-block; max-width: 100%;
+    background: #000; border-radius: 8px; overflow: hidden;
+}
+.img-container img { max-width: 100%; height: auto; display: block; }
+#bbox-canvas {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    pointer-events: none; z-index: 10;
+}
+#draw-canvas {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    z-index: 20; cursor: crosshair;
+}
+.meta {
+    margin: 12px 0; padding: 10px; background: var(--bg2);
+    border-radius: 8px; font-size: 13px; display: grid;
+    grid-template-columns: auto 1fr; gap: 4px 12px;
+}
+.meta .key { color: var(--text2); }
+.meta .val { color: var(--text); }
+.badge {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    font-size: 11px; font-weight: 600;
+}
+.badge-vqa { background: rgba(88,166,255,0.15); color: var(--accent); }
+.badge-ocr { background: rgba(210,153,34,0.15); color: var(--orange); }
+.badge-gnd { background: rgba(63,185,80,0.15); color: var(--green); }
+.badge-bad { background: rgba(248,81,73,0.25); color: var(--red); }
+.question-box {
+    background: var(--bg3); border-radius: 8px; padding: 12px 16px;
+    margin-bottom: 12px; font-size: 14px; border-left: 3px solid var(--accent);
+    white-space: pre-wrap; word-break: break-word;
+}
+.gt-box {
+    background: var(--bg2); border-radius: 8px; padding: 12px 16px;
+    margin-bottom: 12px; font-size: 14px; border-left: 3px solid var(--green);
+    font-family: 'Fira Code', monospace; white-space: pre-wrap; word-break: break-word;
+    color: var(--green);
+}
+#draw-info {
+    margin: 8px 0; padding: 8px 12px; background: var(--bg3);
+    border-radius: 6px; font-size: 13px; font-family: monospace; display: none;
+}
+.help-bar {
+    margin: 6px 0; padding: 6px 12px; background: var(--bg2);
+    border-radius: 6px; font-size: 12px; color: var(--text2);
+}
+.help-bar b { color: var(--accent); }
+@media (max-width: 1000px) {
+    .main { flex-direction: column; height: auto; }
+    .left-panel, .right-panel { max-width: 100%; flex: auto; }
+}
+</style>
+</head>
+<body>
+<div class="header">
+    <h1>🔍 DocSeek Quality Studio</h1>
+    <div class="stats" id="stats"></div>
+</div>
+<div class="filters">
+    <label>Source:</label>
+    <select id="f-source"><option value="">All</option></select>
+    <label>Task:</label>
+    <select id="f-task"><option value="">All</option></select>
+    <label>Element:</label>
+    <select id="f-elem"><option value="">All</option></select>
+    <label>Label:</label>
+    <select id="f-label">
+        <option value="">All</option>
+        <option value="unlabeled">Unlabeled</option>
+        <option value="bad">Bad</option>
+    </select>
+    <label>Search:</label>
+    <input id="f-search" type="text" placeholder="question / GT..." style="width:160px">
+    <button onclick="applyFilters()" style="background:var(--accent);color:#fff;border:none;border-radius:6px;padding:4px 12px;cursor:pointer">Filter</button>
+</div>
+<div class="nav">
+    <button onclick="go(-10)">⏪ -10</button>
+    <button onclick="go(-1)">◀ Prev</button>
+    <span class="pos" id="pos">0 / 0</span>
+    <button onclick="go(1)">Next ▶</button>
+    <button onclick="go(10)">+10 ⏩</button>
+    <button onclick="goRandom()" style="margin-left:12px">🎲 Random</button>
+    <button id="btn-bad" class="btn-bad" onclick="markBad()" style="margin-left:auto">❌ BAD</button>
+</div>
+<div class="main">
+    <div class="left-panel">
+        <div class="img-container" id="img-container">
+            <img id="doc-img" src="" alt="Document Image">
+            <canvas id="bbox-canvas"></canvas>
+            <canvas id="draw-canvas"></canvas>
+        </div>
+        <div id="draw-info">
+            <span style="color:var(--orange)">Your bbox [0-1000]:</span>
+            <span id="draw-coords" style="color:#fff;font-weight:bold"></span>
+            <button onclick="saveBbox()" style="margin-left:12px;background:var(--green);color:#fff;border:none;border-radius:6px;padding:4px 14px;cursor:pointer;font-weight:600">Save bbox (S)</button>
+            <button onclick="clearDraw()" style="margin-left:6px;background:var(--bg3);color:var(--text2);border:1px solid var(--border);border-radius:6px;padding:4px 10px;cursor:pointer">Clear</button>
+        </div>
+        <div class="help-bar">
+            Draw bbox on image to correct | <b>←→</b> navigate | <b>R</b> random | <b>B</b> bad | <b>S</b> save bbox | <b>Space</b> next
+            <span id="bad-count" style="float:right;color:var(--red);font-weight:600"></span>
+        </div>
+        <div class="meta" id="meta"></div>
+    </div>
+    <div class="right-panel">
+        <h3 style="margin:0 0 8px;font-size:14px;color:var(--text2)">Question</h3>
+        <div class="question-box" id="question-box"></div>
+        <h3 style="margin:0 0 8px;font-size:14px;color:var(--text2)">Ground Truth</h3>
+        <div class="gt-box" id="gt-box"></div>
+        <div id="guidelines-section" style="display:none">
+            <h3 style="margin:12px 0 8px;font-size:14px;color:var(--text2);cursor:pointer" onclick="toggleGuidelines()">▸ Guidelines</h3>
+            <div id="guidelines-box" style="display:none;background:var(--bg2);border-radius:8px;padding:12px;font-size:12px;color:var(--text2)"></div>
+        </div>
+    </div>
+</div>
+<script>
+let allSamples = [];
+let filtered = [];
+let ci = 0;  // current index
+let userBbox = null;
+let drawing = false;
+let drawStart = null;
+
+async function init() {
+    const r = await fetch('/api/samples');
+    allSamples = await r.json();
+    // Populate filters
+    const add = (id, vals) => { const el = document.getElementById(id); vals.forEach(v => { const o = document.createElement('option'); o.value = v; o.textContent = v; el.appendChild(o); }); };
+    add('f-source', [...new Set(allSamples.map(s => s.data_source))].sort());
+    add('f-task', [...new Set(allSamples.map(s => s.task_type))].sort());
+    add('f-elem', [...new Set(allSamples.map(s => s.element_type).filter(Boolean))].sort());
+    applyFilters();
+}
+
+function applyFilters() {
+    const src = document.getElementById('f-source').value;
+    const task = document.getElementById('f-task').value;
+    const elem = document.getElementById('f-elem').value;
+    const label = document.getElementById('f-label').value;
+    const search = document.getElementById('f-search').value.toLowerCase();
+    filtered = allSamples.filter(s => {
+        if (src && s.data_source !== src) return false;
+        if (task && s.task_type !== task) return false;
+        if (elem && s.element_type !== elem) return false;
+        if (label === 'bad' && s.label !== 'bad') return false;
+        if (label === 'unlabeled' && s.label === 'bad') return false;
+        if (search && !s.question.toLowerCase().includes(search) && !s.ground_truth.toLowerCase().includes(search)) return false;
+        return true;
+    });
+    const tc = {}; filtered.forEach(s => { tc[s.task_type] = (tc[s.task_type]||0)+1; });
+    const bad = filtered.filter(s => s.label === 'bad').length;
+    document.getElementById('stats').innerHTML =
+        `Showing <b>${filtered.length}</b>/${allSamples.length} | ` +
+        Object.entries(tc).map(([k,v]) => `${k}:<b>${v}</b>`).join(' ') +
+        ` | Bad:<b style="color:var(--red)">${bad}</b>`;
+    ci = 0;
+    render();
+}
+
+function go(d) { if (!filtered.length) return; ci = Math.max(0, Math.min(filtered.length-1, ci+d)); render(); }
+function goRandom() { if (!filtered.length) return; ci = Math.floor(Math.random()*filtered.length); render(); }
+
+function render() {
+    if (!filtered.length) {
+        document.getElementById('pos').textContent = '0 / 0';
+        return;
+    }
+    const s = filtered[ci];
+    document.getElementById('pos').textContent = `${ci+1} / ${filtered.length}  (#${s.index})`;
+
+    // Image
+    const img = document.getElementById('doc-img');
+    img.src = '/api/image?path=' + encodeURIComponent(s.image_path);
+    img.onload = () => { drawBbox(s); initDraw(); clearDraw(); };
+
+    // Meta
+    const tb = `<span class="badge badge-${s.task_type}">${s.task_type}</span>`;
+    const lb = s.label === 'bad' ? ' <span class="badge badge-bad">BAD</span>' : '';
+    const bb = s.bbox ? `[${s.bbox.join(', ')}]` : '—';
+    document.getElementById('meta').innerHTML = `
+        <span class="key">Index</span><span class="val">#${s.index}</span>
+        <span class="key">Source</span><span class="val">${s.data_source}</span>
+        <span class="key">Task</span><span class="val">${tb}${lb}</span>
+        <span class="key">Element</span><span class="val">${s.element_type || '—'}</span>
+        <span class="key">Doc</span><span class="val">${s.doc_id || '—'}</span>
+        <span class="key">Bbox</span><span class="val">${bb}</span>
+    `;
+
+    // Question & GT
+    document.getElementById('question-box').textContent = s.question;
+    document.getElementById('gt-box').textContent = s.ground_truth;
+
+    // Guidelines
+    if (s.guidelines) {
+        document.getElementById('guidelines-section').style.display = 'block';
+        document.getElementById('guidelines-box').textContent = s.guidelines;
+    } else {
+        document.getElementById('guidelines-section').style.display = 'none';
+    }
+
+    // Bad button state
+    const btn = document.getElementById('btn-bad');
+    if (s.label === 'bad') {
+        btn.textContent = '↩️ Undo BAD';
+        btn.className = 'btn-undo';
+        btn.onclick = undoBad;
+    } else {
+        btn.textContent = '❌ BAD';
+        btn.className = 'btn-bad';
+        btn.onclick = markBad;
+    }
+
+    document.getElementById('bad-count').textContent =
+        `Bad: ${allSamples.filter(s=>s.label==='bad').length}`;
+}
+
+function drawBbox(s) {
+    const img = document.getElementById('doc-img');
+    const c = document.getElementById('bbox-canvas');
+    c.width = img.naturalWidth; c.height = img.naturalHeight;
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0, 0, c.width, c.height);
+    if (!s.bbox) return;
+    let [x1,y1,x2,y2] = s.bbox;
+    x1 = x1/1000*c.width; y1 = y1/1000*c.height;
+    x2 = x2/1000*c.width; y2 = y2/1000*c.height;
+    // Dim outside
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.fillRect(0,0,c.width,y1);
+    ctx.fillRect(0,y1,x1,y2-y1);
+    ctx.fillRect(x2,y1,c.width-x2,y2-y1);
+    ctx.fillRect(0,y2,c.width,c.height-y2);
+    // Border
+    const color = s.task_type === 'gnd' ? '#3fb950' : '#58a6ff';
+    ctx.strokeStyle = color;
+    ctx.lineWidth = Math.max(3, c.width/200);
+    ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+    // Label
+    const fs = Math.max(16, c.width/40);
+    ctx.font = `bold ${fs}px sans-serif`;
+    const label = s.task_type.toUpperCase();
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = color;
+    ctx.fillRect(x1, y1-fs-8, tw+12, fs+6);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label, x1+6, y1-10);
+}
+
+async function markBad() {
+    if (!filtered.length) return;
+    const s = filtered[ci];
+    const r = await fetch('/api/label', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: s.index, label: 'bad'})
+    });
+    if ((await r.json()).ok) {
+        s.label = 'bad';
+        // Also update in allSamples
+        allSamples[s.index].label = 'bad';
+        go(1);
+    }
+}
+
+async function undoBad() {
+    if (!filtered.length) return;
+    const s = filtered[ci];
+    const r = await fetch('/api/label', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: s.index, label: ''})
+    });
+    if ((await r.json()).ok) {
+        s.label = '';
+        allSamples[s.index].label = '';
+        render();
+    }
+}
+
+async function saveBbox() {
+    if (!userBbox || !filtered.length) return;
+    const s = filtered[ci];
+    const r = await fetch('/api/save_bbox', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({index: s.index, bbox: userBbox})
+    });
+    if ((await r.json()).ok) {
+        s.bbox = userBbox;
+        allSamples[s.index].bbox = userBbox;
+        clearDraw();
+        render();
+    }
+}
+
+function toggleGuidelines() {
+    const el = document.getElementById('guidelines-box');
+    el.style.display = el.style.display === 'none' ? 'block' : 'none';
+}
+
+// --- Drawing ---
+function getDC() { return document.getElementById('draw-canvas'); }
+function xy(e) {
+    const c = getDC(), r = c.getBoundingClientRect();
+    return { x: (e.clientX-r.left)/r.width, y: (e.clientY-r.top)/r.height };
+}
+function initDraw() {
+    const dc = getDC(), img = document.getElementById('doc-img');
+    dc.width = img.naturalWidth; dc.height = img.naturalHeight;
+    dc.getContext('2d').clearRect(0,0,dc.width,dc.height);
+}
+function clearDraw() {
+    const dc = getDC();
+    dc.getContext('2d').clearRect(0,0,dc.width,dc.height);
+    document.getElementById('draw-info').style.display = 'none';
+    userBbox = null; drawing = false;
+}
+
+getDC().addEventListener('mousedown', e => { if(e.button===2){clearDraw();return;} drawing=true; drawStart=xy(e); });
+getDC().addEventListener('mousemove', e => {
+    if (!drawing) return;
+    const cur = xy(e), dc = getDC(), ctx = dc.getContext('2d');
+    ctx.clearRect(0,0,dc.width,dc.height);
+    const x1=Math.min(drawStart.x,cur.x)*dc.width, y1=Math.min(drawStart.y,cur.y)*dc.height;
+    const x2=Math.max(drawStart.x,cur.x)*dc.width, y2=Math.max(drawStart.y,cur.y)*dc.height;
+    ctx.strokeStyle='#ff8800'; ctx.lineWidth=Math.max(2,dc.width/250);
+    ctx.setLineDash([6,3]); ctx.strokeRect(x1,y1,x2-x1,y2-y1);
+    ctx.fillStyle='rgba(255,136,0,0.12)'; ctx.fillRect(x1,y1,x2-x1,y2-y1);
+    const c = [Math.round(Math.min(drawStart.x,cur.x)*1000), Math.round(Math.min(drawStart.y,cur.y)*1000),
+               Math.round(Math.max(drawStart.x,cur.x)*1000), Math.round(Math.max(drawStart.y,cur.y)*1000)];
+    document.getElementById('draw-coords').textContent = `[${c.join(', ')}]`;
+    document.getElementById('draw-info').style.display = 'block';
+});
+getDC().addEventListener('mouseup', e => {
+    if (!drawing) return; drawing = false;
+    const end = xy(e), dc = getDC(), ctx = dc.getContext('2d');
+    ctx.clearRect(0,0,dc.width,dc.height);
+    const x1=Math.min(drawStart.x,end.x), y1=Math.min(drawStart.y,end.y);
+    const x2=Math.max(drawStart.x,end.x), y2=Math.max(drawStart.y,end.y);
+    const px1=x1*dc.width,py1=y1*dc.height,px2=x2*dc.width,py2=y2*dc.height;
+    ctx.strokeStyle='#ff8800'; ctx.lineWidth=Math.max(3,dc.width/200);
+    ctx.setLineDash([]); ctx.strokeRect(px1,py1,px2-px1,py2-py1);
+    ctx.fillStyle='rgba(255,136,0,0.15)'; ctx.fillRect(px1,py1,px2-px1,py2-py1);
+    const c = [Math.round(x1*1000),Math.round(y1*1000),Math.round(x2*1000),Math.round(y2*1000)];
+    const fs = Math.max(14,dc.width/50);
+    ctx.font=`bold ${fs}px sans-serif`;
+    const lbl=`[${c.join(',')}]`;
+    const tw=ctx.measureText(lbl).width;
+    ctx.fillStyle='rgba(255,136,0,0.85)';
+    ctx.fillRect(px1,py1-fs-8,tw+12,fs+6);
+    ctx.fillStyle='#fff'; ctx.fillText(lbl,px1+6,py1-10);
+    userBbox = c;
+    document.getElementById('draw-coords').textContent = `[${c.join(', ')}]`;
+    document.getElementById('draw-info').style.display = 'block';
+});
+getDC().addEventListener('contextmenu', e => { e.preventDefault(); clearDraw(); });
+
+// Keyboard
+document.addEventListener('keydown', e => {
+    if (e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
+    if (e.key==='ArrowLeft'||e.key==='a') go(-1);
+    else if (e.key==='ArrowRight'||e.key==='d') go(1);
+    else if (e.key==='r'||e.key==='R') goRandom();
+    else if (e.key==='b'||e.key==='B') markBad();
+    else if (e.key==='s'||e.key==='S') saveBbox();
+    else if (e.key===' ') { e.preventDefault(); go(1); }
+});
+
+init();
+</script>
+</body>
+</html>"""
 
 
-# ─── App ─────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# HTTP Handler
+# ---------------------------------------------------------------------------
+class Handler(SimpleHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        if args and "200" in str(args[0]):
+            return
+        super().log_message(fmt, *args)
 
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        p = parsed.path
+        params = parse_qs(parsed.query)
+        if p == "/" or p == "/index.html":
+            self._html()
+        elif p == "/api/samples":
+            self._json(SAMPLES)
+        elif p == "/api/image":
+            self._image(params)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length))
+        if parsed.path == "/api/label":
+            idx = body["index"]
+            label = body["label"]
+            save_label(idx, label)
+            SAMPLES[idx]["label"] = label
+            print(f"  [LABEL] #{idx} → {label or 'cleared'}")
+            self._json({"ok": True})
+        elif parsed.path == "/api/save_bbox":
+            idx = body["index"]
+            bbox = body["bbox"]
+            save_label(idx, "corrected", corrected_bbox=bbox)
+            SAMPLES[idx]["bbox"] = bbox
+            print(f"  [BBOX] #{idx} → {bbox}")
+            self._json({"ok": True})
+        else:
+            self.send_error(404)
+
+    def _html(self):
+        data = HTML_PAGE.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _json(self, obj):
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _image(self, params):
+        path = params.get("path", [""])[0]
+        if not path or not os.path.isfile(path):
+            self.send_error(404, f"Not found: {path}")
+            return
+        mime, _ = mimetypes.guess_type(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", mime or "application/octet-stream")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "max-age=3600")
+        self.end_headers()
+        self.wfile.write(data)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main():
-    init_page()
-    st.markdown("""<div class="hero-card">
-<h2 style="margin:0">🔍 DocSeek Quality Studio</h2>
-<p style="margin:6px 0 0;opacity:.88">Browse, inspect bbox, flag bad samples.</p>
-</div>""", unsafe_allow_html=True)
+    parser = argparse.ArgumentParser(description="DocSeek Data Quality Viewer")
+    parser.add_argument("--parquet", required=True, help="Training parquet file")
+    parser.add_argument("--port", type=int, default=8899)
+    parser.add_argument("--host", type=str, default="0.0.0.0")
+    args = parser.parse_args()
 
-    # --- Sidebar ---
-    default_parquet = "data/docseek/v2/train.parquet"
-    if "--parquet" in sys.argv:
-        i = sys.argv.index("--parquet")
-        if i+1 < len(sys.argv):
-            default_parquet = sys.argv[i+1]
+    global SAMPLES, LABELS, LABELS_PATH
+    LABELS_PATH = str(Path(args.parquet).parent / "quality_labels.jsonl")
 
-    with st.sidebar:
-        st.header("Data Source")
-        parquet_path = st.text_input("Parquet", value=default_parquet)
+    print(f"Loading {args.parquet}...")
+    SAMPLES = load_parquet(args.parquet)
 
-    if not Path(parquet_path).exists():
-        st.error(f"Not found: {parquet_path}")
-        st.stop()
+    # Load existing labels
+    LABELS = load_labels(LABELS_PATH)
+    for idx, lb in LABELS.items():
+        if idx < len(SAMPLES):
+            SAMPLES[idx]["label"] = lb.get("label", "")
+            if lb.get("corrected_bbox"):
+                SAMPLES[idx]["bbox"] = lb["corrected_bbox"]
 
-    df = load_parquet(parquet_path)
-    labels = load_labels(parquet_path)
-    total = len(df)
+    tc = {}
+    for s in SAMPLES:
+        tc[s["task_type"]] = tc.get(s["task_type"], 0) + 1
+    bad = sum(1 for s in SAMPLES if s["label"] == "bad")
 
-    # Build lightweight index
-    records = []
-    for i in range(total):
-        row = df.iloc[i].to_dict()
-        records.append(dict(
-            idx=i,
-            data_source=row.get("data_source", ""),
-            task_type=(row.get("extra_info") or {}).get("task_type", ""),
-            element_type=(row.get("extra_info") or {}).get("element_type", "") or "",
-            label=labels.get(i, {}).get("label", ""),
-        ))
-    index_df = pd.DataFrame(records)
+    print(f"\n{'='*50}")
+    print(f"  DocSeek Quality Studio")
+    print(f"  Samples: {len(SAMPLES)}")
+    print(f"  Tasks: {tc}")
+    print(f"  Bad: {bad}")
+    print(f"  Labels: {LABELS_PATH}")
+    print(f"\n  Open: http://{args.host}:{args.port}")
+    print(f"  Keys: ← → navigate | R random | B bad | S save bbox")
+    print(f"{'='*50}\n")
 
-    # --- Sidebar filters ---
-    with st.sidebar:
-        st.header("Filters")
-        sel_sources = st.multiselect("Data Source",
-            sorted(index_df["data_source"].unique()), default=sorted(index_df["data_source"].unique()))
-        sel_tasks = st.multiselect("Task Type",
-            sorted(index_df["task_type"].unique()), default=sorted(index_df["task_type"].unique()))
-        etypes = sorted([e for e in index_df["element_type"].unique() if e])
-        sel_etypes = st.multiselect("Element Type", etypes, default=etypes) if etypes else []
-        sel_label = st.multiselect("Label", ["unlabeled", "bad"],  default=["unlabeled", "bad"])
-        kw = st.text_input("Keyword")
-
-    # Filter
-    filt = index_df.copy()
-    filt = filt[filt["data_source"].isin(sel_sources)]
-    filt = filt[filt["task_type"].isin(sel_tasks)]
-    if sel_etypes:
-        filt = filt[(filt["element_type"].isin(sel_etypes)) | (filt["element_type"] == "")]
-    lmask = filt["label"].isin(sel_label) | ((filt["label"] == "") & ("unlabeled" in sel_label))
-    filt = filt[lmask]
-    if kw.strip():
-        # need to check question/gt — do a quick pass
-        kw_lower = kw.strip().lower()
-        keep_idx = set()
-        for idx_val in filt["idx"]:
-            row = df.iloc[idx_val].to_dict()
-            f = extract_fields(row)
-            if kw_lower in f["question"].lower() or kw_lower in str(f["ground_truth"]).lower():
-                keep_idx.add(idx_val)
-        filt = filt[filt["idx"].isin(keep_idx)]
-
-    kept = len(filt)
-
-    # Stats
-    with st.sidebar:
-        st.markdown("---")
-        st.metric("Total", total)
-        st.metric("Showing", kept)
-        st.metric("Bad", sum(1 for v in labels.values() if v.get("label") == "bad"))
-
-    # --- Metrics ---
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Total", total)
-    m2.metric("Showing", kept)
-    m3.metric("VQA", len(filt[filt["task_type"] == "vqa"]))
-    m4.metric("GND", len(filt[filt["task_type"] == "gnd"]))
-    m5.metric("OCR", len(filt[filt["task_type"] == "ocr"]))
-
-    if kept == 0:
-        st.warning("No samples match.")
-        st.stop()
-
-    # --- Table ---
-    st.subheader("Filtered Table")
-    st.dataframe(
-        filt[["idx", "data_source", "task_type", "element_type", "label"]],
-        use_container_width=True, hide_index=True, height=250,
-    )
-
-    # --- Sample selector ---
-    st.subheader("Sample Detail")
-    options = filt["idx"].tolist()
-
-    last = st.session_state.get("sel_idx")
-    if last not in options:
-        last = options[0]
-    default_pos = options.index(last)
-
-    selected = st.selectbox(
-        "Select sample",
-        options=options,
-        index=default_pos,
-        format_func=lambda i: (
-            f"#{i}  |  {index_df.iloc[i]['data_source']}  |  "
-            f"{index_df.iloc[i]['task_type']}  |  "
-            f"{index_df.iloc[i]['element_type']}"
-            f"{'  🚫' if labels.get(i, {}).get('label') == 'bad' else ''}"
-        ),
-    )
-    st.session_state["sel_idx"] = selected
-
-    # Load full sample
-    row = df.iloc[selected].to_dict()
-    fields = extract_fields(row)
-    bbox = extract_bbox(fields)
-    corrected = labels.get(selected, {}).get("corrected_bbox")
-    if corrected:
-        bbox = corrected
-
-    # --- Detail ---
-    c1, c2 = st.columns([1.25, 1.0])
-
-    with c1:
-        ip = fields["image_path"]
-        if ip and Path(ip).exists():
-            image = Image.open(ip).convert("RGB")
-
-            show_bbox = st.checkbox("Show bbox", value=True)
-            disp = image
-            if bbox and show_bbox:
-                color = "#16a34a" if fields["task_type"] == "gnd" else "#0ea5e9"
-                disp = draw_bbox_on_image(image, bbox, color, fields["task_type"].upper())
-
-            st.image(disp, use_container_width=True)
-            st.caption(f"{Path(ip).name}  |  {image.size[0]}×{image.size[1]}")
-
-            # Bbox editor
-            if bbox:
-                with st.expander("✏️ Edit bbox"):
-                    bc = st.columns(4)
-                    nb = [
-                        bc[0].number_input("x1", 0, 1000, int(bbox[0]), key="bx1"),
-                        bc[1].number_input("y1", 0, 1000, int(bbox[1]), key="by1"),
-                        bc[2].number_input("x2", 0, 1000, int(bbox[2]), key="bx2"),
-                        bc[3].number_input("y2", 0, 1000, int(bbox[3]), key="by2"),
-                    ]
-                    if nb != list(bbox):
-                        st.image(draw_bbox_on_image(image, nb, "#f59e0b", "EDIT"),
-                                 use_container_width=True)
-                        if st.button("💾 Save bbox"):
-                            save_label(parquet_path, selected, "corrected", corrected_bbox=nb)
-                            st.rerun()
-        else:
-            st.error(f"Image not found: {ip}")
-
-    with c2:
-        # Bad button
-        cur_label = labels.get(selected, {}).get("label", "")
-        if cur_label == "bad":
-            st.markdown('<span class="label-bad">BAD</span>', unsafe_allow_html=True)
-            if st.button("↩️ Undo", use_container_width=True):
-                save_label(parquet_path, selected, "")
-                st.rerun()
-        else:
-            if st.button("❌ Mark BAD", use_container_width=True, type="primary"):
-                save_label(parquet_path, selected, "bad")
-                # Auto advance
-                pos = options.index(selected)
-                if pos + 1 < len(options):
-                    st.session_state["sel_idx"] = options[pos + 1]
-                st.rerun()
-
-        note = st.text_input("Note")
-        if note and st.button("Save"):
-            save_label(parquet_path, selected, cur_label, note=note)
-            st.success("Saved")
-
-        # Question
-        st.markdown("---")
-        st.markdown("**Question**")
-        q = fields["question"].replace("<image>\n", "").strip()
-        parts = q.split("Guidelines:")
-        st.code(parts[0].strip()[:400], language=None, wrap_lines=True)
-        if len(parts) > 1:
-            with st.expander("Guidelines"):
-                st.caption(parts[1].strip())
-
-        # Ground Truth
-        st.markdown("**Ground Truth**")
-        gt = fields["ground_truth"]
-        if isinstance(gt, list):
-            st.code(json.dumps(gt, ensure_ascii=False), language="json", wrap_lines=True)
-        else:
-            st.code(str(gt), language=None, wrap_lines=True)
-
-        # Info
-        st.markdown("**Info**")
-        st.json(dict(
-            data_source=fields["data_source"], task_type=fields["task_type"],
-            element_type=fields["element_type"], doc_id=fields["doc_id"],
-            bbox=bbox,
-        ))
-
-    # --- Export ---
-    st.markdown("---")
-    bad_list = sorted(i for i, lb in labels.items() if lb.get("label") == "bad")
-    st.metric("Total bad", len(bad_list))
-    if bad_list:
-        st.download_button("Download bad indices", json.dumps(bad_list),
-                           "bad_indices.json", "application/json")
+    server = HTTPServer((args.host, args.port), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+        server.shutdown()
 
 
 if __name__ == "__main__":
