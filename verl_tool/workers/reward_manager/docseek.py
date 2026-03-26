@@ -195,7 +195,7 @@ class DocSeekRewardManager:
         self.add_action_redundancy_penalty = True
         self.group_tool_call_rate_lower_bound = 0.3  # H in the paper
         self.action_redundancy_limit = 1  # n_{vo}
-        self.alpha = 0.5
+        self.alpha = 0.0  # Disabled: curiosity penalty suppresses zoom learning
         self.beta = 0.05
 
     def get_group_info(self, data: DataProto):
