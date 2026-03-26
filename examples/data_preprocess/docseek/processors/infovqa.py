@@ -63,11 +63,11 @@ class InfoVQAProcessor(DatasetProcessor):
             if not os.path.exists(image_path):
                 continue
 
-            # Hard case filter (score IDs are 1-based)
+            # Keep only 0 < pass_rate < 1.0
             if self.filter_pass_rate and scores:
                 score_id = f"{self.scores_id_prefix}_{i+1:05d}"
                 pass_rate = scores.get(score_id, None)
-                if pass_rate is not None and pass_rate >= 1.0:
+                if pass_rate is not None and (pass_rate >= 1.0 or pass_rate == 0):
                     continue
 
             answers = item.get("answers", [])

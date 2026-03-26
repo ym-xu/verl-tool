@@ -67,11 +67,11 @@ class VISAProcessor(DatasetProcessor):
                 self._stats["skipped_no_image"] += 1
                 continue
 
-            # Hard case filter
+            # Hard case filter: keep only 0 < pass_rate < 1.0
             if self.filter_pass_rate and scores:
                 record_id = item["id"]
                 pass_rate = scores.get(record_id, None)
-                if pass_rate is not None and pass_rate >= 1.0:
+                if pass_rate is not None and (pass_rate >= 1.0 or pass_rate == 0):
                     continue
 
             answers = item.get("answers", [])
