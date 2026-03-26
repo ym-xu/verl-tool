@@ -286,6 +286,11 @@ class DocSeekRewardManager:
                 score_fn = self.TASK_SCORE_FN.get(task_type, docseek_vqa_score)
                 task_score = score_fn(response_str, ground_truth)
 
+            # Format reward: did the model use \boxed{}?
+            boxed_answer = extract_boxed_answer(response_str)
+            format_score = 1.0 if boxed_answer is not None else 0.0
+            score['format_accuracy'] = format_score
+
             score['accuracy'] = task_score
             score['score'] = task_score
             score['task_type'] = task_type
